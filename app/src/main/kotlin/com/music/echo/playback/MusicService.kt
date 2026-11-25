@@ -157,6 +157,8 @@ import echo.music.iad1tya.models.PersistQueue
 import echo.music.iad1tya.models.toMediaMetadata
 import echo.music.iad1tya.musicflow.MusicFlowQueue
 import echo.music.iad1tya.playback.audio.BeatAnalyzer
+import echo.music.iad1tya.playback.audio.CacheMediaDataSource
+import echo.music.iad1tya.playback.crossfade.AutomixPlanner
 import echo.music.iad1tya.playback.audio.SilenceDetectorAudioProcessor
 import echo.music.iad1tya.playback.queues.EmptyQueue
 import echo.music.iad1tya.playback.queues.ListQueue
@@ -341,23 +343,56 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
     val nextId: String,
   )
 
-  /** Beat-aligned transition computed from cached BeatInfoEntity of both tracks. */
+  /** A transition planned from the beat analysis of both tracks (see [AutomixPlanner]). */
   private data class AutomixPlan(
     val currentId: String,
     val nextId: String,
-    val triggerTimeMs: Long,
-    val incomingStartMs: Long,
-    val tempoRatio: Float,
-    /** Harmonic correction on the incoming track's pitch, capped at ±3 semitones. */
-    val pitchRatio: Float = 1f,
-    /** DJ blend length: 16 beats of the outgoing track, clamped to sane bounds. */
-    val overlapMs: Long,
-  )
+    val transition: AutomixPlanner.Plan,
+    /** Speed and pitch the user plays at; the blend's time stretch applies on top. */
+    val baseParameters: PlaybackParameters,
+  ) {
+    val triggerTimeMs: Long
+      get() = transition.triggerMs
+
+    val incomingStartMs: Long
+      get() = transition.incomingStartMs
+
+    val overlapMs: Long
+      get() = transition.overlapMs
+
+    val isBeatMatch: Boolean
+      get() = transition.style == AutomixPlanner.Style.BEAT_MATCH
+
+    /** What the incoming player starts with: the user's speed, stretched to the outgoing tempo. */
+    val incomingParameters: PlaybackParameters
+      get() =
+        PlaybackParameters(baseParameters.speed * transition.incomingSpeed, baseParameters.pitch)
+  }
 
   private data class AutomixPlanResult(
     val plan: AutomixPlan?,
     val pairAnalyzed: Boolean,
+    /** Outgoing position from which planning again may find more (a lossless tail now cached). */
+    val replanAtMs: Long? = null,
   )
+
+  /** Stream measurements of lossless files, by "mediaId:head" / "mediaId:tail". */
+  private val streamProbes =
+    java.util.concurrent.ConcurrentHashMap<String, Pair<Long, BeatAnalyzer.Result?>>()
+
+  /** Returns the incoming player to the user's tempo after a stretched blend. */
+  private var tempoRestoreJob: Job? = null
+  /** The user's speed and pitch while [tempoRestoreJob] eases back to them. */
+  private var tempoRestoreTarget: PlaybackParameters? = null
+
+  /** The speed and pitch the user chose, not a blend's passing stretch. */
+  private fun userPlaybackParameters(): PlaybackParameters =
+    tempoRestoreTarget?.takeIf { tempoRestoreJob?.isActive == true }
+      ?: try {
+        player.playbackParameters
+      } catch (e: Exception) {
+        PlaybackParameters.DEFAULT
+      }
 
   /** Live state of the automix engine, surfaced in the player debug overlay. */
   data class AutomixDebugInfo(
@@ -371,6 +406,8 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
     val triggerTimeMs: Long? = null,
     val incomingStartMs: Long? = null,
     val tempoRatio: Float? = null,
+    /** Beat drift measured during the blend and corrected, in ms. */
+    val phaseErrorMs: Long? = null,
   )
 
   val automixDebugInfo = MutableStateFlow<AutomixDebugInfo?>(null)
@@ -5636,7 +5673,7 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
       // behind slower far-queue lookahead fetches.
       val planResult =
         if (automixEnabled) {
-          computeAutomixPlan(baseTriggerTime, trackDuration)
+          computeAutomixPlan(trackDuration)
         } else {
           AutomixPlanResult(plan = null, pairAnalyzed = false)
         }
@@ -5648,16 +5685,24 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
       // Poll playback position instead of a wall-clock delay: position freezes on
       // pause, so the trigger can't misfire while paused and get lost.
       var prebufferStarted = false
+      val replanAt = planResult.replanAtMs
       while (isActive) {
         if (player.currentMediaItem?.mediaId != targetMediaId) return@launch
-        val remaining = triggerTime - player.currentPosition
+        val position = player.currentPosition
+        // A lossless tail cached since the plan was made can turn it into a beat match.
+        if (replanAt != null && position >= replanAt && !prebufferStarted) {
+          scheduleCrossfade()
+          return@launch
+        }
+        val remaining = triggerTime - position
         if (remaining <= 0) break
         val leadTime = preArmManager.currentLeadTimeMs
         if (!prebufferStarted && remaining <= leadTime) {
           prebufferStarted = true
           prebufferSecondaryPlayer(plan)
         }
-        delay(minOf(remaining, 100L))
+        // Fine polling near the trigger: a blend on the beat must start within a few ms.
+        delay(minOf(remaining, if (remaining < 400) 5L else 100L))
       }
       if (
         isActive &&
@@ -5675,14 +5720,12 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
   }
 
   /**
-   * Builds a beat-aligned transition from cached beat analysis of the outgoing and incoming tracks.
-   * Returns null (plain crossfade fallback) when either track lacks usable analysis; kicks off lazy
-   * analysis in that case so a later transition can align.
+   * Plans the transition from the beat analysis of the outgoing and incoming tracks (see
+   * [AutomixPlanner]): a beat-matched blend when both have a clear beat at close tempos, else a
+   * smooth crossfade placed at musical points. Returns no plan (plain crossfade) only while the
+   * outgoing track has no analysis yet; kicks off the analysis in that case.
    */
-  private suspend fun computeAutomixPlan(
-    baseTriggerTime: Long,
-    trackDuration: Long,
-  ): AutomixPlanResult {
+  private suspend fun computeAutomixPlan(trackDuration: Long): AutomixPlanResult {
     val pair = currentAutomixPair() ?: return AutomixPlanResult(plan = null, pairAnalyzed = false)
     val currentId = pair.currentId
     val nextId = pair.nextId
@@ -5702,141 +5745,167 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
         inConfidence = inBeat?.confidence,
         inMixInMs = inBeat?.mixInPointMs,
       )
-    if (outBeat == null || inBeat == null) {
-      Timber.tag(TAG)
-        .d(
-          "Automix fallback: beat info missing (current=%s next=%s)",
-          outBeat != null,
-          inBeat != null,
-        )
-      automixDebugInfo.value =
-        partialDebug.copy(
-          status =
-            "fallback: analysis pending (" +
-              (if (outBeat == null) "current" else "") +
-              (if (outBeat == null && inBeat == null) "+" else "") +
-              (if (inBeat == null) "next" else "") +
-              ")",
-        )
+    if (outBeat == null) {
+      automixDebugInfo.value = partialDebug.copy(status = "fallback: analysis pending (current)")
       return AutomixPlanResult(plan = null, pairAnalyzed = false)
     }
-    if (
-      outBeat.confidence < 0.3f || inBeat.confidence < 0.3f || outBeat.bpm <= 0f || inBeat.bpm <= 0f
-    ) {
-      Timber.tag(TAG)
-        .d(
-          "Automix fallback: low confidence (out=%.2f/%.0fbpm in=%.2f/%.0fbpm)",
-          outBeat.confidence,
-          outBeat.bpm,
-          inBeat.confidence,
-          inBeat.bpm,
-        )
-      automixDebugInfo.value = partialDebug.copy(status = "fallback: low confidence")
-      return AutomixPlanResult(plan = null, pairAnalyzed = true)
+
+    // A lossless file plays a different encode than the one analyzed (YouTube's): measure its
+    // start and end from what the cache already holds before trusting the beat positions.
+    var replanAtMs: Long? = null
+    val outTrack = automixTrack(outBeat, trackDuration, currentId, tail = true)
+    if (!outTrack.gridTrusted && streamIsLossless(currentId)) {
+      // The tail is usually cached a little later: plan again before the blend.
+      replanAtMs = (trackDuration - 45_000).coerceAtLeast(player.currentPosition + 5_000)
     }
-
-    val periodMs = (60_000f / outBeat.bpm).toDouble()
-
-    // DJ blend: 16 beats of the outgoing track (4 bars), 6-16s bounds.
-    val overlapMs = (16 * periodMs).toLong().coerceIn(6_000L, 16_000L)
-
-    // Dynamic mix-out: start the transition where the song's body ends (outro begins)
-    // rather than a fixed distance from the end. Sentinel <= 0 means "no outro found".
-    val latestTrigger = trackDuration - overlapMs
-    val mixOut = outBeat.mixOutPointMs?.takeIf { it > 0 }
-    val effectiveTrigger = mixOut?.coerceAtMost(latestTrigger) ?: latestTrigger
-
-    // Snap the fade start onto an 8-beat phrase boundary of the outgoing track's grid.
-    // Anchor past the current position so re-planning late (pause/seek near the end)
-    // still lands on the next musical boundary instead of giving up.
-    val phraseMs = periodMs * 8
-    val anchor = maxOf(effectiveTrigger, player.currentPosition + 1000)
-    val k = ((anchor - outBeat.firstBeatOffsetMs) / phraseMs).toLong()
-    var triggerTime = (outBeat.firstBeatOffsetMs + k * phraseMs).toLong()
-    if (triggerTime < anchor)
-      triggerTime = (outBeat.firstBeatOffsetMs + (k + 1) * phraseMs).toLong()
-    // Phrase-snapping can push triggerTime past latestTrigger by up to ~1 phrase.
-    // The outgoing player keeps its own playlist and keeps advancing in real time
-    // during the fade, so the full overlap must fit before its natural end or it
-    // auto-advances on its own mid-fade — playing the next track a second time (or
-    // wrapping to track 1 on repeat-all). Rather than discarding the whole plan for
-    // a few seconds of overshoot, shrink the overlap to whatever room is actually
-    // left; only fall back if that leaves too little room to blend at all.
-    val roomMs = trackDuration - 500 - triggerTime
-    val effectiveOverlapMs = overlapMs.coerceAtMost(roomMs)
-    if (effectiveOverlapMs < 3000L || triggerTime >= trackDuration - 3000) {
-      Timber.tag(TAG)
-        .d(
-          "Automix fallback: trigger %d out of range (pos=%d dur=%d overlap=%d)",
-          triggerTime,
-          player.currentPosition,
-          trackDuration,
-          overlapMs,
-        )
-      automixDebugInfo.value = partialDebug.copy(status = "fallback: trigger out of range")
-      return AutomixPlanResult(plan = null, pairAnalyzed = true)
-    }
-
-    // Fold octave errors, then cap pitch-preserving stretch at ±8%.
-    var tempoRatio = outBeat.bpm / inBeat.bpm
-    while (tempoRatio > 1.5f) tempoRatio /= 2f
-    while (tempoRatio < 0.667f) tempoRatio *= 2f
-    if (tempoRatio !in 0.92f..1.08f) tempoRatio = 1f
-
-    // Harmonic correction: compare keys via their relative-major pitch class (a minor
-    // key's relative major sits 3 semitones up), then pitch-shift the incoming track
-    // the minimal circular distance to align. Skip when either key is unknown, when
-    // they already match, or when the shift would be large enough to sound worse than
-    // the clash it's fixing (>3 semitones).
-    var pitchRatio = 1f
-    val outKeyClass = outBeat.keyPitchClass
-    val inKeyClass = inBeat.keyPitchClass
-    if (outKeyClass != null && inKeyClass != null) {
-      val outEffective = if (outBeat.keyIsMinor == true) (outKeyClass + 3) % 12 else outKeyClass
-      val inEffective = if (inBeat.keyIsMinor == true) (inKeyClass + 3) % 12 else inKeyClass
-      var semitoneShift = (outEffective - inEffective) % 12
-      if (semitoneShift > 6) semitoneShift -= 12
-      if (semitoneShift < -6) semitoneShift += 12
-      if (semitoneShift != 0 && kotlin.math.abs(semitoneShift) <= 3) {
-        pitchRatio = Math.pow(2.0, semitoneShift / 12.0).toFloat()
+    val inTrack =
+      inBeat?.let { entity ->
+        val nextIndex = player.nextMediaItemIndex
+        val metadataDuration =
+          if (nextIndex == C.INDEX_UNSET) null
+          else player.getMediaItemAt(nextIndex).metadata?.duration?.takeIf { it > 0 }?.times(1000L)
+        val duration = entity.analyzedDurationMs?.takeIf { it > 0 } ?: metadataDuration ?: 0L
+        automixTrack(entity, duration, nextId, tail = false)
       }
-    }
 
-    // Dynamic mix-in: skip the incoming track's intro, snapped onto its own 8-beat grid.
-    val inPeriodMs = (60_000f / inBeat.bpm).toDouble()
-    val rawStart = inBeat.mixInPointMs?.takeIf { it > 0 } ?: inBeat.firstBeatOffsetMs
-    val inPhraseMs = inPeriodMs * 8
-    val inK =
-      kotlin.math.ceil((rawStart - inBeat.firstBeatOffsetMs) / inPhraseMs).toLong().coerceAtLeast(0)
-    val incomingStart = (inBeat.firstBeatOffsetMs + inK * inPhraseMs).toLong()
-
-    val plan =
-      AutomixPlan(
-        currentId = currentId,
-        nextId = nextId,
-        triggerTimeMs = triggerTime,
-        incomingStartMs = incomingStart,
-        tempoRatio = tempoRatio,
-        pitchRatio = pitchRatio,
-        overlapMs = effectiveOverlapMs,
+    val transition =
+      AutomixPlanner.plan(
+        out = outTrack,
+        incoming = inTrack,
+        positionMs = player.currentPosition,
+        fadeMs = crossfadeDuration.toLong(),
       )
+    if (transition == null) {
+      automixDebugInfo.value = partialDebug.copy(status = "fallback: trigger out of range")
+      return AutomixPlanResult(plan = null, pairAnalyzed = inBeat != null)
+    }
+    val plan = AutomixPlan(currentId, nextId, transition, userPlaybackParameters())
     Timber.tag(TAG)
       .d(
-        "Automix plan: trigger=%dms incomingStart=%dms tempoRatio=%.3f pitchRatio=%.3f overlap=%dms",
+        "Automix plan (%s): trigger=%dms incomingStart=%dms speed=%.3f overlap=%dms swap=%.2f",
+        transition.reason,
         plan.triggerTimeMs,
         plan.incomingStartMs,
-        plan.tempoRatio,
-        plan.pitchRatio,
+        transition.incomingSpeed,
         plan.overlapMs,
+        transition.bassSwapAt,
       )
     automixDebugInfo.value =
       partialDebug.copy(
-        status = "plan ready",
+        status = "plan ready: ${transition.reason}",
         triggerTimeMs = plan.triggerTimeMs,
         incomingStartMs = plan.incomingStartMs,
-        tempoRatio = plan.tempoRatio,
+        tempoRatio = transition.incomingSpeed,
       )
-    return AutomixPlanResult(plan = plan, pairAnalyzed = true)
+    return AutomixPlanResult(plan = plan, pairAnalyzed = inBeat != null, replanAtMs = replanAtMs)
+  }
+
+  /** Whether [mediaId] plays (or will play, its start prefetched) from an addon's lossless file. */
+  private fun streamIsLossless(mediaId: String): Boolean =
+    isPlayingFromAddon(mediaId) ||
+      runCatching {
+          playerCache.getContentMetadata(mediaId).get(CACHE_SOURCE_KEY, null as String?) ==
+            CACHE_SOURCE_ADDON
+        }
+        .getOrDefault(false)
+
+  /**
+   * The planner's view of a track. For a lossless stream the beat positions come from measuring
+   * that stream's cached start ([tail] false) or end ([tail] true); without that measurement only
+   * the tempo is kept, and the mix points too when the two encodes have the same length.
+   */
+  private suspend fun automixTrack(
+    entity: BeatInfoEntity,
+    durationMs: Long,
+    mediaId: String,
+    tail: Boolean,
+  ): AutomixPlanner.Track {
+    fun Long?.valid(): Long? = this?.takeIf { it >= 0 }
+    val base =
+      AutomixPlanner.Track(
+        bpm = entity.bpm,
+        confidence = entity.confidence,
+        firstBeatOffsetMs = entity.firstBeatOffsetMs,
+        durationMs = durationMs.takeIf { it > 0 } ?: entity.analyzedDurationMs ?: 0L,
+        downbeatOffsetMs = entity.downbeatOffsetMs,
+        headAnchorMs = entity.headAnchorMs,
+        tailAnchorMs = entity.tailAnchorMs,
+        mixInMs = entity.mixInPointMs.valid(),
+        mixOutMs = entity.mixOutPointMs.valid(),
+        firstSoundMs = entity.firstSoundMs,
+        lastSoundMs = entity.lastSoundMs,
+        keyPitchClass = entity.keyPitchClass,
+        keyIsMinor = entity.keyIsMinor,
+      )
+    if (mediaId.isLocalMediaId() || !streamIsLossless(mediaId) || entity.bpm <= 0f) return base
+
+    val probe = probeLosslessStream(mediaId, entity.bpm, tail)
+    val anchor = if (tail) probe?.tailAnchorMs else probe?.headAnchorMs
+    if (probe != null && anchor != null) {
+      Timber.tag(TAG)
+        .d("Automix: lossless %s measured, %s bar at %d ms", mediaId, if (tail) "end" else "start", anchor)
+      return if (tail) {
+        base.copy(
+          tailAnchorMs = anchor,
+          downbeatOffsetMs = null,
+          mixOutMs = probe.mixOutPointMs,
+          lastSoundMs = probe.lastSoundMs,
+          durationMs = probe.durationMs.takeIf { it > 0 } ?: base.durationMs,
+        )
+      } else {
+        base.copy(
+          headAnchorMs = anchor,
+          downbeatOffsetMs = null,
+          mixInMs = probe.mixInPointMs,
+          firstSoundMs = probe.firstSoundMs,
+        )
+      }
+    }
+    val analyzed = entity.analyzedDurationMs
+    val sameEdit = analyzed != null && durationMs > 0 && kotlin.math.abs(analyzed - durationMs) <= 1_500
+    return if (sameEdit) {
+      base.copy(gridTrusted = false)
+    } else {
+      base.copy(
+        gridTrusted = false,
+        mixInMs = null,
+        mixOutMs = null,
+        firstSoundMs = null,
+        lastSoundMs = null,
+      )
+    }
+  }
+
+  /**
+   * Measures the start or end of a lossless stream from the cache alone, never the network. A
+   * failure is tried again after a while, as more of the file gets cached.
+   */
+  private suspend fun probeLosslessStream(
+    mediaId: String,
+    bpm: Float,
+    tail: Boolean,
+  ): BeatAnalyzer.Result? {
+    val key = "$mediaId:${if (tail) "tail" else "head"}"
+    val now = System.currentTimeMillis()
+    streamProbes[key]?.let { (at, result) ->
+      if (result != null || now - at < 20_000) return result
+    }
+    val result =
+      withContext(Dispatchers.IO) {
+        runCatching {
+            val cache =
+              if (downloadCache.getCachedSpans(mediaId).isNotEmpty()) downloadCache else playerCache
+            val source = CacheMediaDataSource(cache, mediaId)
+            if (!source.isUsable) {
+              null
+            } else {
+              source.use { BeatAnalyzer.probe(it, bpm, head = !tail, tail = tail) }
+            }
+          }
+          .getOrNull()
+      }
+    streamProbes[key] = now to result
+    return result
   }
 
   /**
@@ -5919,8 +5988,8 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
 
   private suspend fun runBeatAnalysis(mediaId: String, priority: BeatAnalysisPriority) {
     val existing = database.beatInfo(mediaId)
-    // Skip when analyzed with mix points (null mixOut = pre-mix-point row, rescan once).
-    if (existing != null && !(existing.bpm > 0f && existing.mixOutPointMs == null)) return
+    // Rows of an older analysis are redone once: they lack the bars measured at the edges.
+    if (existing != null && existing.analysisVersion >= BeatAnalyzer.VERSION) return
     Timber.tag(TAG).d("Beat analysis starting for %s (%s)", mediaId, priority)
 
     val result: BeatAnalyzer.Result?
@@ -5975,8 +6044,24 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
           mixOutPointMs = it.mixOutPointMs ?: -1L,
           keyPitchClass = it.keyPitchClass,
           keyIsMinor = it.keyIsMinor,
+          analysisVersion = BeatAnalyzer.VERSION,
+          downbeatOffsetMs = it.downbeatOffsetMs,
+          headAnchorMs = it.headAnchorMs,
+          tailAnchorMs = it.tailAnchorMs,
+          firstSoundMs = it.firstSoundMs,
+          lastSoundMs = it.lastSoundMs,
+          analyzedDurationMs = it.durationMs.takeIf { d -> d > 0 },
         )
-      } ?: BeatInfoEntity(mediaId, 0f, 0L, 0f, mixInPointMs = -1L, mixOutPointMs = -1L)
+      }
+        ?: BeatInfoEntity(
+          mediaId,
+          0f,
+          0L,
+          0f,
+          mixInPointMs = -1L,
+          mixOutPointMs = -1L,
+          analysisVersion = BeatAnalyzer.VERSION,
+        )
     withContext(Dispatchers.IO) { database.upsert(entity) }
 
     // Fresh data may unlock a beat-aligned plan for the ongoing transition:
@@ -6075,6 +6160,8 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
           PlaybackParameters.DEFAULT
         }
       if (base != PlaybackParameters.DEFAULT) secPlayer.playbackParameters = base
+      // A plan carries the user's speed plus the stretch to the outgoing tempo.
+      secPlayer.playbackParameters = plan.incomingParameters
     }
     secPlayer.volume = 0f
     secPlayer.repeatMode = savedRepeatMode
@@ -6135,6 +6222,8 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
             PlaybackParameters.DEFAULT
           }
         if (base != PlaybackParameters.DEFAULT) secPlayer.playbackParameters = base
+        // A plan carries the user's speed plus the stretch to the outgoing tempo.
+        secPlayer.playbackParameters = plan.incomingParameters
       }
       secPlayer.volume = 0f
       secPlayer.repeatMode = savedRepeatMode
@@ -6155,7 +6244,7 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
 
   private fun performCrossfadeSwap() {
     isCrossfading.value = true
-    isAutomixing.value = activeAutomixPlan != null
+    isAutomixing.value = activeAutomixPlan?.isBeatMatch == true
     if (activeAutomixPlan != null) {
       automixDebugInfo.value = automixDebugInfo.value?.copy(status = "automixing now")
     }
@@ -6292,62 +6381,72 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
           1f
         }
 
-      // Bass-swap ducking (DJ blend only): cut the outgoing track's low end as it
-      // drops and hold the incoming track's low end back until it takes over, so
-      // two full basslines don't sum into mud during the overlap.
+      // Bass swap and high-pass sweep (DJ blend only), so two full basslines never sum into
+      // mud during the overlap.
       val outDuck = fadingPlayer?.let { playerDuckProcessors[it] }
       val inDuck = playerDuckProcessors[player]
+      val phaseLock = djPlan?.takeIf { it.isBeatMatch }?.let { PhaseLock(it) }
 
-      // Equal-power curve: delegate to EqualPowerCurve for constant acoustic power
-      fun equalPowerIn(edge0: Float, edge1: Float, x: Float): Float {
-        val t = ((x - edge0) / (edge1 - edge0)).coerceIn(0f, 1f)
-        return echo.music.iad1tya.playback.crossfade.EqualPowerCurve.calculateGains(t).incomingGain
-      }
-      fun equalPowerOut(edge0: Float, edge1: Float, x: Float): Float {
-        val t = ((x - edge0) / (edge1 - edge0)).coerceIn(0f, 1f)
-        return echo.music.iad1tya.playback.crossfade.EqualPowerCurve.calculateGains(t).outgoingGain
-      }
+      fun waitWhilePaused(): Boolean = !player.isPlaying &&
+        player.playerError == null &&
+        fadingPlayer?.playbackState != Player.STATE_ENDED
+
+      fun outgoingGone(): Boolean =
+        fadingPlayer?.playbackState == Player.STATE_ENDED ||
+          fadingPlayer?.playbackState == Player.STATE_IDLE
 
       try {
-        for (i in 0..steps) {
-          if (!isActive) break
-
-          while (
-            !player.isPlaying &&
-              isActive &&
-              player.playerError == null &&
-              fadingPlayer?.playbackState != Player.STATE_ENDED
-          ) {
+        if (djPlan != null) {
+          // Driven by the outgoing song's own position, so the bass swap lands on its bar
+          // whatever the scheduler's timing.
+          var playingMs = 0L
+          while (isActive) {
+            while (isActive && waitWhilePaused()) delay(15)
+            if (!isActive || player.playerError != null) break
+            if (outgoingGone()) break
+            // An outgoing stream stuck buffering must not hold the blend open forever.
+            if (playingMs > duration * 3 / 2 + 3_000) break
+            val outPos = fadingPlayer?.currentPosition ?: break
+            val progress =
+              ((outPos - djPlan.triggerTimeMs).toFloat() / duration.coerceAtLeast(1)).coerceIn(0f, 1f)
+            val mix = AutomixPlanner.mixAt(djPlan.transition, progress)
+            try {
+              player.volume = startVolume * mix.inGain
+              fadingPlayer?.volume = startVolume * mix.outGain
+            } catch (e: Exception) {
+              break
+            }
+            if (djPlan.isBeatMatch) {
+              outDuck?.setMix(mix.outBassCut)
+              outDuck?.setHighPass(mix.outHighPass)
+              inDuck?.setMix(mix.inBassCut)
+            }
+            if (progress < djPlan.transition.bassSwapAt) phaseLock?.step(outPos)
+            if (progress >= 1f) break
             delay(15)
+            playingMs += 15
           }
-          if (!isActive || player.playerError != null) break
-
-          if (
-            fadingPlayer?.playbackState == androidx.media3.common.Player.STATE_ENDED ||
-              fadingPlayer?.playbackState == androidx.media3.common.Player.STATE_IDLE
-          ) {
-            player.volume = startVolume
-            break
+        } else {
+          for (i in 0..steps) {
+            if (!isActive) break
+            while (isActive && waitWhilePaused()) delay(15)
+            if (!isActive || player.playerError != null) break
+            if (outgoingGone()) {
+              player.volume = startVolume
+              break
+            }
+            val gains =
+              echo.music.iad1tya.playback.crossfade.EqualPowerCurve.calculateGains(
+                (i / steps.toFloat()).coerceIn(0f, 1f)
+              )
+            try {
+              player.volume = startVolume * gains.incomingGain
+              fadingPlayer?.volume = startVolume * gains.outgoingGain
+            } catch (e: Exception) {
+              break
+            }
+            delay(stepTime)
           }
-
-          val progress = (i / steps.toFloat()).coerceIn(0f, 1f)
-          val gains = echo.music.iad1tya.playback.crossfade.EqualPowerCurve.calculateGains(progress)
-
-          try {
-            player.volume = startVolume * gains.incomingGain
-            fadingPlayer?.volume = startVolume * gains.outgoingGain
-          } catch (e: Exception) {
-            break
-          }
-
-          if (djPlan != null) {
-            // Outgoing bass cuts through the same 0.45-1.0 window it fades
-            // out in; incoming bass fills back in through 0-0.55.
-            outDuck?.setMix(equalPowerIn(0.45f, 1f, progress))
-            inDuck?.setMix(1f - equalPowerIn(0f, 0.55f, progress))
-          }
-
-          delay(stepTime)
         }
       } finally {
         try {
@@ -6358,8 +6457,113 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
         }
         outDuck?.resetGain()
         inDuck?.resetGain()
+        phaseLock?.let { lock ->
+          automixDebugInfo.value = automixDebugInfo.value?.copy(phaseErrorMs = lock.lastErrorMs)
+        }
         cleanupCrossfade()
         activeAutomixPlan = null
+        if (djPlan != null && djPlan.transition.incomingSpeed != 1f) restoreTempo(djPlan)
+      }
+    }
+  }
+
+  /**
+   * Keeps the incoming song's beats on the outgoing song's while they overlap. Where it should be
+   * follows from the plan (incomingStart + time since the trigger × speed); a few ms of start-up
+   * latency or a late trigger shows up as an offset, which a short, slight change of speed absorbs.
+   * Never a seek: that would be heard.
+   */
+  private inner class PhaseLock(private val plan: AutomixPlan) {
+    private var nextCheckAtMs = 0L
+    private var nudgeEndsAtMs = 0L
+    private var nudges = 0
+    private var gaveUp = false
+    var lastErrorMs: Long? = null
+      private set
+
+    fun step(outPos: Long) {
+      if (gaveUp) return
+      val now = android.os.SystemClock.elapsedRealtime()
+      if (nudgeEndsAtMs != 0L && now >= nudgeEndsAtMs) {
+        nudgeEndsAtMs = 0L
+        setSpeed(plan.transition.incomingSpeed)
+        nextCheckAtMs = now + 400 // let the speed change settle before measuring again
+        return
+      }
+      if (nudgeEndsAtMs != 0L || now < nextCheckAtMs) return
+      nextCheckAtMs = now + 250
+      // Wait for the incoming song's audio to be running before judging it.
+      if (!player.isPlaying || outPos < plan.triggerTimeMs + 300) return
+      val speed = plan.transition.incomingSpeed
+      val expected = plan.incomingStartMs + (outPos - plan.triggerTimeMs) * speed
+      val errorMs = (player.currentPosition - expected).toLong()
+      lastErrorMs = errorMs
+      automixDebugInfo.value = automixDebugInfo.value?.copy(phaseErrorMs = errorMs)
+      when {
+        // Off by more than a beat: a stall, not drift. Ride it out on the fades.
+        kotlin.math.abs(errorMs) > PHASE_GIVE_UP_MS -> gaveUp = true
+        kotlin.math.abs(errorMs) <= PHASE_DEADBAND_MS -> Unit
+        nudges >= MAX_PHASE_NUDGES -> Unit
+        else -> {
+          // Absorb the offset over NUDGE_MS at most 3 % faster or slower.
+          val correction = (-errorMs.toFloat() / PHASE_NUDGE_MS).coerceIn(-0.03f, 0.03f)
+          val nudgeMs = (kotlin.math.abs(errorMs) / kotlin.math.abs(correction)).toLong()
+          setSpeed(speed * (1 + correction))
+          nudgeEndsAtMs = now + nudgeMs.coerceIn(200L, PHASE_NUDGE_MS.toLong() * 2)
+          nudges++
+          Timber.tag(TAG)
+            .d("Automix phase: %d ms off, speed x%.3f for %d ms", errorMs, 1 + correction, nudgeMs)
+        }
+      }
+    }
+
+    private fun setSpeed(speed: Float) {
+      try {
+        player.playbackParameters =
+          PlaybackParameters(plan.baseParameters.speed * speed, plan.baseParameters.pitch)
+      } catch (e: Exception) {
+        gaveUp = true
+      }
+    }
+  }
+
+  /**
+   * Eases the incoming song from the blend's stretched tempo back to the user's speed, in steps too
+   * small to hear. Stops at once (at the user's speed) on a seek or track change, and stops for good
+   * if the user changes the speed meanwhile.
+   */
+  private fun restoreTempo(plan: AutomixPlan) {
+    tempoRestoreJob?.cancel()
+    val target = plan.baseParameters
+    tempoRestoreTarget = target
+    val restoredPlayer = player
+    val mediaId = restoredPlayer.currentMediaItem?.mediaId
+    tempoRestoreJob = scope.launch {
+      val startedAt = android.os.SystemClock.elapsedRealtime()
+      var lastSet = restoredPlayer.playbackParameters
+      try {
+        while (isActive) {
+          if (player !== restoredPlayer || restoredPlayer.currentMediaItem?.mediaId != mediaId) break
+          if (restoredPlayer.playbackParameters != lastSet) return@launch // the user took over
+          if (!restoredPlayer.isPlaying) {
+            delay(100)
+            continue
+          }
+          val elapsed = android.os.SystemClock.elapsedRealtime() - startedAt
+          val speed = AutomixPlanner.restoreSpeedAt(plan.transition, elapsed)
+          val wanted = PlaybackParameters(target.speed * speed, target.pitch)
+          // Each change makes the sink drain its processors: change only in ~0.4 % steps.
+          if (kotlin.math.abs(wanted.speed / lastSet.speed - 1f) >= 0.004f || speed == 1f) {
+            restoredPlayer.playbackParameters = wanted
+            lastSet = wanted
+          }
+          if (speed == 1f) return@launch
+          delay(100)
+        }
+        // Interrupted: leave the user's speed in place.
+        if (restoredPlayer.playbackParameters == lastSet) restoredPlayer.playbackParameters = target
+      } catch (e: Exception) {
+        Timber.tag(TAG).d(e, "Tempo restore stopped")
       }
     }
   }
@@ -6415,6 +6619,14 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
     /** Waiting for data this soon after a seek or a track change is not a stall. */
     private const val STALL_GRACE_MS = 3_000L
     private const val CACHE_SOURCE_KEY = "echo-source"
+    /** Beat offset the automix phase lock leaves alone, in ms. */
+    private const val PHASE_DEADBAND_MS = 12
+    /** Speed nudges per blend at most. */
+    private const val MAX_PHASE_NUDGES = 4
+    /** How long a phase nudge takes to absorb an offset. */
+    private const val PHASE_NUDGE_MS = 2_000f
+    /** An offset past this is a stall, not drift: the lock gives up. */
+    private const val PHASE_GIVE_UP_MS = 400
     private const val CACHE_SOURCE_ADDON = "addon"
     private const val CACHE_SOURCE_YOUTUBE = "youtube"
     /** A saved episode position is applied only while the episode is still at its start. */

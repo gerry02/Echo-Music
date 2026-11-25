@@ -595,7 +595,8 @@ fun BottomSheetPlayer(
             Text(
               "mix @ ${makeTimeString(dbg.triggerTimeMs)} (in ${remainingS}s)" +
                 (dbg.incomingStartMs?.let { "  from ${makeTimeString(it)}" } ?: "") +
-                (dbg.tempoRatio?.let { "  ×%.3f".format(it) } ?: ""),
+                (dbg.tempoRatio?.let { "  ×%.3f".format(it) } ?: "") +
+                (dbg.phaseErrorMs?.let { "  phase ${it}ms" } ?: ""),
               style = mono,
               color = Color.White.copy(alpha = 0.85f),
             )

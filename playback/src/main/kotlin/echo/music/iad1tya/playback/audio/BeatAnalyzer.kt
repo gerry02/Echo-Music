@@ -2,61 +2,93 @@ package echo.music.iad1tya.playback.audio
 
 import android.content.Context
 import android.media.MediaCodec
+import android.media.MediaDataSource
 import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.net.Uri
 import androidx.media3.common.C
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.DataSpec
-import kotlin.math.cos
-import kotlin.math.ln
+import kotlin.math.abs
+import kotlin.math.ceil
+import kotlin.math.floor
 import kotlin.math.max
-import kotlin.math.min
-import kotlin.math.roundToInt
 import kotlin.math.roundToLong
-import kotlin.math.sin
-import kotlin.math.sqrt
 import timber.log.Timber
 
 /**
- * Offline BPM + beat-grid analyzer. Classical DSP, no ML: decode -> mono PCM -> STFT -> spectral
- * flux onset envelope -> autocorrelation tempo estimate -> comb-filter phase for beat offset.
- *
- * Beat times of the track are: firstBeatOffsetMs + k * (60000 / bpm).
+ * Offline beat analysis for automix. Classical DSP, no ML (see [BeatDsp]): the tempo comes from 18 s
+ * in the middle of the song; the beats and bars near the start and the end, where the mixes happen,
+ * are measured there again instead of being extrapolated from the middle, so the grid holds to the
+ * millisecond where it is used.
  */
 object BeatAnalyzer {
 
+  /** Bumped when the analysis changes so stored rows are redone once. */
+  const val VERSION = 2
+
   data class Result(
     val bpm: Float,
+    /** A beat of the grid measured in the middle: beats are at this + k * 60000 / bpm. */
     val firstBeatOffsetMs: Long,
     val confidence: Float,
+    /** Where the intro ends (energy reaches the song's body), on a downbeat. Null: starts hot. */
     val mixInPointMs: Long? = null,
+    /** Where the outro starts (energy leaves the body), on a downbeat. Null: loud to the end. */
     val mixOutPointMs: Long? = null,
     /** 0=C, 1=C#, ... 11=B. Null when the chroma signal was too weak to call a key. */
     val keyPitchClass: Int? = null,
     val keyIsMinor: Boolean? = null,
+    /** A first beat of a bar of the middle grid. */
+    val downbeatOffsetMs: Long? = null,
+    /** A first beat of a bar measured in the first seconds of the song. */
+    val headAnchorMs: Long? = null,
+    /** A first beat of a bar measured in the last seconds of the song. */
+    val tailAnchorMs: Long? = null,
+    /** Where the audio starts after leading silence. */
+    val firstSoundMs: Long? = null,
+    /** Where the audio ends before trailing silence. */
+    val lastSoundMs: Long? = null,
+    /** Length of the analyzed audio, to tell another edit of the song apart. */
+    val durationMs: Long = 0L,
+  )
+
+  /** Decoded parts of a song, positions in ms from its start. */
+  class Windows(
+    val durationMs: Long,
+    val middle: MonoPcm? = null,
+    val middleStartMs: Long = 0L,
+    val head: MonoPcm? = null,
+    val headStartMs: Long = 0L,
+    val tail: MonoPcm? = null,
+    val tailStartMs: Long = 0L,
   )
 
   private const val TAG = "BeatAnalyzer"
 
-  private const val FFT_SIZE = 1024
-  private const val HOP_SIZE = 512
-  private const val MIN_BPM = 60f
-  private const val MAX_BPM = 180f
-
   /** Analysis window: 18s taken from the middle of the track. */
   private const val WINDOW_US = 18_000_000L
 
-  /** Energy-scan windows for dynamic mix points. */
-  private const val HEAD_WINDOW_US = 16_000_000L
-  private const val TAIL_WINDOW_US = 24_000_000L
+  /** Windows where the mixes happen. */
+  private const val HEAD_WINDOW_US = 20_000_000L
+  private const val TAIL_WINDOW_US = 30_000_000L
 
   /** Canonical BPM range; octave-fold estimates into it (61.9 -> 123.8, 160 -> 80...). */
   private const val MIN_CANONICAL_BPM = 70f
   private const val MAX_CANONICAL_BPM = 140f
   private const val ENERGY_BLOCK_MS = 500
+  private const val SOUND_BLOCK_MS = 10
   private const val MAX_INTRO_SKIP_MS = 20_000L
   private const val MAX_OUTRO_CUT_MS = 45_000L
+
+  /** Comb strength from which a window has a beat of its own (1 = none). */
+  private const val MIN_LOCAL_BEAT_STRENGTH = 1.3f
+
+  /** Bar-phase confidence from which a window's own downbeat beats the middle grid's. */
+  private const val LOCAL_BAR_CONFIDENCE = 0.2f
+
+  /** Silence threshold, about -50 dBFS RMS. */
+  private const val SILENCE_RMS = 0.0032f
 
   /** Hard cap on bytes fetched for analysis. Keeps automix responsive on slow streams. */
   private const val MAX_FETCH_BYTES = 5L * 1024 * 1024
@@ -65,7 +97,10 @@ object BeatAnalyzer {
     context: Context,
     uri: Uri,
     shouldCancel: () -> Boolean = { false },
-  ): Result? = analyze(shouldCancel) { extractor -> extractor.setDataSource(context, uri, null) }
+  ): Result? =
+    analyzeSource(shouldCancel = shouldCancel) { extractor ->
+      extractor.setDataSource(context, uri, null)
+    }
 
   /**
    * @param result null when the (possibly partial) data couldn't be analyzed.
@@ -75,9 +110,9 @@ object BeatAnalyzer {
   class CachedAnalysis(val result: Result?, val complete: Boolean)
 
   /**
-   * Fetches the track through the app's playback data-source chain (resolver + caches + network)
-   * into a temp file and analyzes that. Cached data is served locally; otherwise this costs one
-   * audio download — once per track, results are stored in the DB.
+   * Fetches the track through the given data-source chain into a temp file and analyzes that.
+   * Cached data is served locally; otherwise this costs one audio download — once per track, results
+   * are stored in the DB.
    */
   @UnstableApi
   fun analyzeStream(
@@ -105,10 +140,6 @@ object BeatAnalyzer {
               reachedEnd = true
               break
             }
-            if (shouldCancel()) {
-              Timber.tag(TAG).d("Stream fetch for %s cancelled at %d bytes", mediaId, copied)
-              return null
-            }
             out.write(buf, 0, read)
             copied += read
           }
@@ -127,14 +158,41 @@ object BeatAnalyzer {
 
       if (shouldCancel()) return null
       val result =
-        analyze(shouldCancel) { extractor -> extractor.setDataSource(tempFile.absolutePath) }
+        analyzeSource(shouldCancel = shouldCancel) { extractor ->
+          extractor.setDataSource(tempFile.absolutePath)
+        }
       return CachedAnalysis(result, reachedEnd)
     } finally {
       tempFile.delete()
     }
   }
 
-  private fun analyze(
+  /**
+   * Measures the start and/or the end of the stream actually played (e.g. a lossless file of the
+   * song analyzed from YouTube) with the tempo already known, reading only what [source] holds.
+   */
+  fun probe(
+    source: MediaDataSource,
+    knownBpm: Float,
+    head: Boolean,
+    tail: Boolean,
+    shouldCancel: () -> Boolean = { false },
+  ): Result? =
+    analyzeSource(
+      knownBpm = knownBpm,
+      wantMiddle = false,
+      wantHead = head,
+      wantTail = tail,
+      shouldCancel = shouldCancel,
+    ) { extractor ->
+      extractor.setDataSource(source)
+    }
+
+  private fun analyzeSource(
+    knownBpm: Float? = null,
+    wantMiddle: Boolean = true,
+    wantHead: Boolean = true,
+    wantTail: Boolean = true,
     shouldCancel: () -> Boolean = { false },
     setSource: (MediaExtractor) -> Unit,
   ): Result? {
@@ -154,90 +212,44 @@ object BeatAnalyzer {
         }
       }
       if (trackIndex < 0 || format == null) return null
-
       extractor.selectTrack(trackIndex)
       val durationUs =
-        if (format.containsKey(MediaFormat.KEY_DURATION)) {
-          format.getLong(MediaFormat.KEY_DURATION)
-        } else 0L
+        if (format.containsKey(MediaFormat.KEY_DURATION)) format.getLong(MediaFormat.KEY_DURATION)
+        else 0L
 
-      val windowStartUs = max(0L, durationUs / 2 - WINDOW_US / 2)
-      extractor.seekTo(windowStartUs, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
-      val actualStartUs = max(0L, extractor.sampleTime)
-
-      if (shouldCancel()) return null
-      val pcm = decodeMono(extractor, format, WINDOW_US, shouldCancel) ?: return null
-      if (pcm.samples.size < FFT_SIZE * 8) return null
-
-      if (shouldCancel()) return null
-      val key = estimateKey(pcm.samples, pcm.sampleRate)
-
-      if (shouldCancel()) return null
-      val flux = spectralFlux(pcm.samples)
-      val frameRate = pcm.sampleRate.toFloat() / HOP_SIZE
-
-      val (periodFrames, confidence) = estimateTempoPeriod(flux, frameRate) ?: return null
-      val phaseFrames = estimateBeatPhase(flux, periodFrames)
-
-      var periodMs = periodFrames / frameRate * 1000f
-      var bpm = 60_000f / periodMs
-      // Octave-fold into the canonical range: the beat grid stays valid because
-      // doubling/halving the period keeps the same phase anchor.
-      while (bpm < MIN_CANONICAL_BPM) {
-        bpm *= 2f
-        periodMs /= 2f
-      }
-      while (bpm >= MAX_CANONICAL_BPM) {
-        bpm /= 2f
-        periodMs *= 2f
-      }
-      val windowStartMs = actualStartUs / 1000
-      val anchorMs = windowStartMs + (phaseFrames / frameRate * 1000f).roundToLong()
-      // Extrapolate the periodic grid back to the start of the track.
-      val firstBeatOffsetMs =
-        (anchorMs % periodMs.roundToLong() + periodMs.roundToLong()) % periodMs.roundToLong()
-
-      // Head pass: skip low-energy intros; start the incoming track on the first
-      // sustained-energy downbeat instead.
-      var mixInPointMs: Long? = null
-      if (durationUs > HEAD_WINDOW_US) {
-        extractor.seekTo(0, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
-        decodeMono(extractor, format, HEAD_WINDOW_US, shouldCancel)?.let { head ->
-          mixInPointMs =
-            detectMixIn(
-              energyEnvelope(head.samples, head.sampleRate),
-              firstBeatOffsetMs,
-              periodMs,
-            )
+      fun window(startUs: Long, lengthUs: Long): Pair<MonoPcm, Long>? {
+        if (shouldCancel()) return null
+        return try {
+          extractor.seekTo(startUs, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
+          val actualStartMs = max(0L, extractor.sampleTime) / 1000
+          decodeMono(extractor, format, lengthUs, shouldCancel)?.let { it to actualStartMs }
+        } catch (e: Exception) {
+          Timber.tag(TAG).d("Window at %d us not readable (%s)", startUs, e.message)
+          null
         }
       }
 
-      // Tail pass: detect where the body of the song ends (outro starts) so the
-      // transition can begin there instead of a fixed distance from the end.
-      var mixOutPointMs: Long? = null
-      val durationMs = durationUs / 1000
-      if (durationUs > TAIL_WINDOW_US) {
-        val tailStartUs = durationUs - TAIL_WINDOW_US
-        extractor.seekTo(tailStartUs, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
-        val tailActualStartMs = max(0L, extractor.sampleTime) / 1000
-        decodeMono(extractor, format, TAIL_WINDOW_US, shouldCancel)?.let { tail ->
-          mixOutPointMs =
-            detectMixOut(
-              energyEnvelope(tail.samples, tail.sampleRate),
-              tailActualStartMs,
-              durationMs,
-            )
-        }
-      }
+      val middle =
+        if (wantMiddle) window(max(0L, durationUs / 2 - WINDOW_US / 2), WINDOW_US) else null
+      if (wantMiddle && middle == null) return null
+      val head = if (wantHead && durationUs > HEAD_WINDOW_US) window(0L, HEAD_WINDOW_US) else null
+      val tail =
+        if (wantTail && durationUs > TAIL_WINDOW_US) {
+          window(durationUs - TAIL_WINDOW_US, TAIL_WINDOW_US)
+        } else null
+      if (shouldCancel()) return null
 
-      return Result(
-        bpm,
-        firstBeatOffsetMs,
-        confidence,
-        mixInPointMs,
-        mixOutPointMs,
-        key?.first,
-        key?.second,
+      return analyzePcm(
+        Windows(
+          durationMs = durationUs / 1000,
+          middle = middle?.first,
+          middleStartMs = middle?.second ?: 0L,
+          head = head?.first,
+          headStartMs = head?.second ?: 0L,
+          tail = tail?.first,
+          tailStartMs = tail?.second ?: 0L,
+        ),
+        knownBpm,
       )
     } catch (e: Exception) {
       Timber.tag(TAG).w(e, "Beat analysis failed")
@@ -247,7 +259,224 @@ object BeatAnalyzer {
     }
   }
 
-  private class MonoPcm(val samples: FloatArray, val sampleRate: Int)
+  private class LocalGrid(val beatMs: Double, val spectrum: BeatDsp.Spectrum, val startMs: Long)
+
+  /** Everything from the decoded windows; pure, so unit tests can feed it synthetic songs. */
+  fun analyzePcm(windows: Windows, knownBpm: Float? = null): Result? {
+    val midSpectrum = windows.middle?.let { BeatDsp.spectrum(it) }
+
+    var periodMs: Double
+    var confidence: Float
+    if (midSpectrum != null) {
+      val (periodFrames, conf) =
+        BeatDsp.tempoPeriod(midSpectrum.flux, midSpectrum.frameRate) ?: return null
+      periodMs = midSpectrum.frameToMs(periodFrames.toDouble())
+      confidence = conf
+    } else if (knownBpm != null && knownBpm > 0f) {
+      periodMs = 60_000.0 / knownBpm
+      confidence = 1f
+    } else {
+      return null
+    }
+    // Octave-fold into the canonical range.
+    while (60_000.0 / periodMs < MIN_CANONICAL_BPM) periodMs /= 2
+    while (60_000.0 / periodMs >= MAX_CANONICAL_BPM) periodMs *= 2
+
+    val headSpectrum = windows.head?.let { BeatDsp.spectrum(it) }
+    val tailSpectrum = windows.tail?.let { BeatDsp.spectrum(it) }
+    if (midSpectrum != null) {
+      // The autocorrelation peak is good to ~0.3 %, which over three minutes is half a beat:
+      // sharpen it with combs over every window, then with beats minutes apart.
+      val spectra = listOfNotNull(midSpectrum, headSpectrum, tailSpectrum)
+      fun score(p: Double): Double =
+        spectra.sumOf { s ->
+          (BeatDsp.beatPhase(s.flux, s.msToFrame(p), spread = 0.0)?.strength ?: 0f).toDouble()
+        }
+      var best = periodMs
+      var bestScore = score(periodMs)
+      for (step in -30..30) {
+        val p = periodMs * (1 + step * 0.0005)
+        val sc = score(p)
+        if (sc > bestScore) {
+          bestScore = sc
+          best = p
+        }
+      }
+      periodMs = best
+    }
+
+    // Middle grid: beat phase and bar phase.
+    var midBeatMs: Double? = null
+    var midDownbeatMs: Double? = null
+    if (midSpectrum != null) {
+      val periodFrames = midSpectrum.msToFrame(periodMs)
+      val phase = BeatDsp.beatPhase(midSpectrum.flux, periodFrames) ?: return null
+      midBeatMs = windows.middleStartMs + midSpectrum.frameToMs(phase.phaseFrames)
+      val bar = BeatDsp.downbeatPhase(midSpectrum, phase.phaseFrames, periodFrames)
+      midDownbeatMs = midBeatMs + (bar?.first ?: 0) * periodMs
+    }
+    val key = midSpectrum?.let { BeatDsp.key(it) }
+
+    // Local beat grids where the mixes happen.
+    fun local(spectrum: BeatDsp.Spectrum?, startMs: Long): LocalGrid? {
+      spectrum ?: return null
+      val phase = BeatDsp.beatPhase(spectrum.flux, spectrum.msToFrame(periodMs)) ?: return null
+      if (phase.strength < MIN_LOCAL_BEAT_STRENGTH) return null
+      return LocalGrid(startMs + spectrum.frameToMs(phase.phaseFrames), spectrum, startMs)
+    }
+    var headGrid = local(headSpectrum, windows.headStartMs)
+    var tailGrid = local(tailSpectrum, windows.tailStartMs)
+
+    // Two local beats minutes apart pin the period far tighter than any one window can.
+    if (headGrid != null && tailGrid != null) {
+      val span = tailGrid.beatMs - headGrid.beatMs
+      val beats = (span / periodMs).roundToLong()
+      if (beats > 16) {
+        val refined = span / beats
+        if (abs(refined / periodMs - 1) < 0.001) {
+          periodMs = refined
+          headGrid = local(headSpectrum, windows.headStartMs) ?: headGrid
+          tailGrid = local(tailSpectrum, windows.tailStartMs) ?: tailGrid
+        }
+      }
+    }
+
+    // Bar phase of a local grid: from the middle grid's bars when known, else its own.
+    fun localDownbeat(grid: LocalGrid?): Double? {
+      grid ?: return null
+      val barMs = periodMs * 4
+      val periodFrames = grid.spectrum.msToFrame(periodMs)
+      val phaseFrames = grid.spectrum.msToFrame(grid.beatMs - grid.startMs)
+      val bar = BeatDsp.downbeatPhase(grid.spectrum, phaseFrames, periodFrames)
+      if (bar != null && (bar.second >= LOCAL_BAR_CONFIDENCE || midDownbeatMs == null)) {
+        return grid.beatMs + bar.first * periodMs
+      }
+      if (midDownbeatMs != null) {
+        return (0 until 4)
+          .map { grid.beatMs + it * periodMs }
+          .minByOrNull { candidate ->
+            val offset = ((candidate - midDownbeatMs) % barMs + barMs) % barMs
+            minOf(offset, barMs - offset)
+          }
+      }
+      return grid.beatMs
+    }
+    val headAnchor = localDownbeat(headGrid)
+    val tailAnchor = localDownbeat(tailGrid)
+
+    val firstSound = windows.head?.let { firstSoundMs(it, windows.headStartMs) }
+    val lastSound = windows.tail?.let { lastSoundMs(it, windows.tailStartMs) }
+
+    // A bar grid near the start, best measured there.
+    val headBars = headAnchor ?: midDownbeatMs ?: midBeatMs
+    val tailBars = tailAnchor ?: midDownbeatMs ?: midBeatMs
+
+    val mixIn =
+      windows.head?.let { head ->
+        detectIntroEnd(BeatDsp.energyEnvelope(head, ENERGY_BLOCK_MS), windows.headStartMs)
+          // The body starts within the energy block that crossed the threshold.
+          ?.let { raw ->
+            if (headBars != null) snapUp((raw - ENERGY_BLOCK_MS).toDouble(), headBars, periodMs * 4)
+            else raw.toDouble()
+          }
+          ?.roundToLong()
+      }
+    val mixOut =
+      windows.tail?.let { tail ->
+        detectOutroStart(
+            BeatDsp.energyEnvelope(tail, ENERGY_BLOCK_MS),
+            windows.tailStartMs,
+            windows.durationMs,
+          )
+          ?.let { raw -> if (tailBars != null) snapNearest(raw.toDouble(), tailBars, periodMs * 4) else raw.toDouble() }
+          ?.roundToLong()
+      }
+
+    val gridAnchor = midBeatMs ?: headGrid?.beatMs ?: tailGrid?.beatMs ?: return null
+    val barAnchor = midDownbeatMs ?: headAnchor ?: tailAnchor
+    return Result(
+      bpm = (60_000.0 / periodMs).toFloat(),
+      firstBeatOffsetMs = positiveMod(gridAnchor, periodMs).roundToLong(),
+      confidence = confidence,
+      mixInPointMs = mixIn,
+      mixOutPointMs = mixOut,
+      keyPitchClass = key?.first,
+      keyIsMinor = key?.second,
+      downbeatOffsetMs = barAnchor?.let { positiveMod(it, periodMs * 4).roundToLong() },
+      headAnchorMs = headAnchor?.roundToLong(),
+      tailAnchorMs = tailAnchor?.roundToLong(),
+      firstSoundMs = firstSound,
+      lastSoundMs = lastSound,
+      durationMs = windows.durationMs,
+    )
+  }
+
+  private fun positiveMod(value: Double, period: Double): Double = ((value % period) + period) % period
+
+  /** The first grid point at or after [value]; a few ms of tolerance keep a point on itself. */
+  internal fun snapUp(value: Double, anchor: Double, period: Double): Double {
+    val k = ceil((value - anchor - 5) / period)
+    return anchor + k * period
+  }
+
+  internal fun snapNearest(value: Double, anchor: Double, period: Double): Double {
+    val k = floor((value - anchor) / period + 0.5)
+    return anchor + k * period
+  }
+
+  private fun firstSoundMs(pcm: MonoPcm, startMs: Long): Long? {
+    val env = BeatDsp.energyEnvelope(pcm, SOUND_BLOCK_MS)
+    val threshold = max(SILENCE_RMS, 0.02f * BeatDsp.percentile(env, 0.9f))
+    val i = env.indexOfFirst { it >= threshold }
+    return if (i < 0) null else startMs + i.toLong() * SOUND_BLOCK_MS
+  }
+
+  private fun lastSoundMs(pcm: MonoPcm, startMs: Long): Long? {
+    val env = BeatDsp.energyEnvelope(pcm, SOUND_BLOCK_MS)
+    val threshold = max(SILENCE_RMS, 0.02f * BeatDsp.percentile(env, 0.9f))
+    val i = env.indexOfLast { it >= threshold }
+    return if (i < 0) null else startMs + (i + 1).toLong() * SOUND_BLOCK_MS
+  }
+
+  /** First block where energy reaches and sustains near body level. Null when the track starts hot. */
+  private fun detectIntroEnd(env: FloatArray, startMs: Long): Long? {
+    if (env.size < 8) return null
+    val ref = BeatDsp.percentile(env, 0.75f)
+    if (ref <= 0f) return null
+    var candidate = -1
+    for (i in 0 until env.size - 4) {
+      if (
+        env[i] >= 0.55f * ref &&
+          env[i + 1] >= 0.4f * ref &&
+          env[i + 2] >= 0.4f * ref &&
+          env[i + 3] >= 0.4f * ref
+      ) {
+        candidate = i
+        break
+      }
+    }
+    if (candidate <= 1) return null // starts hot
+    val ms = startMs + candidate.toLong() * ENERGY_BLOCK_MS
+    return if (ms > MAX_INTRO_SKIP_MS) null else ms
+  }
+
+  /** Last moment the tail is still at body loudness. Null when loud almost to the end. */
+  private fun detectOutroStart(env: FloatArray, windowStartMs: Long, durationMs: Long): Long? {
+    if (env.size < 8 || durationMs <= 0) return null
+    val ref = BeatDsp.percentile(env, 0.75f)
+    if (ref <= 0f) return null
+    var lastLoud = -1
+    for (i in env.indices.reversed()) {
+      if (env[i] >= 0.5f * ref) {
+        lastLoud = i
+        break
+      }
+    }
+    if (lastLoud < 0) return null
+    val ms = windowStartMs + (lastLoud + 1).toLong() * ENERGY_BLOCK_MS
+    if (durationMs - ms < 3_000) return null
+    return max(ms, durationMs - MAX_OUTRO_CUT_MS)
+  }
 
   private fun decodeMono(
     extractor: MediaExtractor,
@@ -310,8 +539,8 @@ object BeatAnalyzer {
         }
       }
     } catch (e: Exception) {
-      Timber.tag(TAG).w(e, "Decode failed")
-      return null
+      Timber.tag(TAG).d("Decode stopped (%s)", e.message)
+      if (out.isEmpty()) return null
     } finally {
       try {
         codec.stop()
@@ -327,322 +556,6 @@ object BeatAnalyzer {
       chunk.copyInto(samples, pos)
       pos += chunk.size
     }
-    return MonoPcm(samples, sampleRate)
-  }
-
-  /** RMS energy per ENERGY_BLOCK_MS block. */
-  private fun energyEnvelope(samples: FloatArray, sampleRate: Int): FloatArray {
-    val blockSize = (sampleRate * ENERGY_BLOCK_MS / 1000).coerceAtLeast(1)
-    val numBlocks = samples.size / blockSize
-    val env = FloatArray(numBlocks)
-    for (b in 0 until numBlocks) {
-      var sum = 0f
-      val offset = b * blockSize
-      for (i in 0 until blockSize) {
-        val s = samples[offset + i]
-        sum += s * s
-      }
-      env[b] = sqrt(sum / blockSize)
-    }
-    return env
-  }
-
-  private fun percentile(values: FloatArray, p: Float): Float {
-    if (values.isEmpty()) return 0f
-    val sorted = values.sorted()
-    return sorted[((sorted.size - 1) * p).roundToInt().coerceIn(0, sorted.size - 1)]
-  }
-
-  /**
-   * First block where energy reaches and sustains near body level, snapped forward onto the beat
-   * grid. Null when the track starts hot (no intro worth skipping).
-   */
-  private fun detectMixIn(env: FloatArray, firstBeatOffsetMs: Long, periodMs: Float): Long? {
-    if (env.size < 8) return null
-    val ref = percentile(env, 0.75f)
-    if (ref <= 0f) return null
-
-    var candidateBlock = -1
-    for (i in 0 until env.size - 4) {
-      if (
-        env[i] >= 0.55f * ref &&
-          env[i + 1] >= 0.4f * ref &&
-          env[i + 2] >= 0.4f * ref &&
-          env[i + 3] >= 0.4f * ref
-      ) {
-        candidateBlock = i
-        break
-      }
-    }
-    if (candidateBlock <= 0) return null // starts hot; keep default first-downbeat start
-
-    val candidateMs = candidateBlock.toLong() * ENERGY_BLOCK_MS
-    if (candidateMs > MAX_INTRO_SKIP_MS) return null
-
-    // Snap forward to the next downbeat.
-    val k = kotlin.math.ceil((candidateMs - firstBeatOffsetMs) / periodMs.toDouble()).toLong()
-    return (firstBeatOffsetMs + max(0L, k) * periodMs.toDouble()).roundToLong()
-  }
-
-  /**
-   * Last moment the tail window is still at body loudness; everything after is outro. Null when the
-   * track stays loud to the end (no early mix-out warranted).
-   */
-  private fun detectMixOut(env: FloatArray, windowStartMs: Long, durationMs: Long): Long? {
-    if (env.size < 8 || durationMs <= 0) return null
-    val ref = percentile(env, 0.75f)
-    if (ref <= 0f) return null
-
-    var lastLoudBlock = -1
-    for (i in env.indices.reversed()) {
-      if (env[i] >= 0.5f * ref) {
-        lastLoudBlock = i
-        break
-      }
-    }
-    if (lastLoudBlock < 0) return null
-
-    val mixOutMs = windowStartMs + (lastLoudBlock + 1).toLong() * ENERGY_BLOCK_MS
-    // Loud almost to the end: nothing to cut.
-    if (durationMs - mixOutMs < 3_000) return null
-    // Never butcher more than MAX_OUTRO_CUT_MS.
-    return max(mixOutMs, durationMs - MAX_OUTRO_CUT_MS)
-  }
-
-  /** Half-wave-rectified spectral flux per hop, log-compressed magnitudes. */
-  private fun spectralFlux(samples: FloatArray): FloatArray {
-    val window = FloatArray(FFT_SIZE) { 0.5f - 0.5f * cos(2.0 * Math.PI * it / FFT_SIZE).toFloat() }
-    val numFrames = (samples.size - FFT_SIZE) / HOP_SIZE
-    val bins = FFT_SIZE / 2
-    val flux = FloatArray(numFrames)
-    val prevMag = FloatArray(bins)
-    val re = FloatArray(FFT_SIZE)
-    val im = FloatArray(FFT_SIZE)
-
-    for (frame in 0 until numFrames) {
-      val offset = frame * HOP_SIZE
-      for (i in 0 until FFT_SIZE) {
-        re[i] = samples[offset + i] * window[i]
-        im[i] = 0f
-      }
-      fft(re, im)
-      var sum = 0f
-      for (b in 0 until bins) {
-        val mag = ln(1f + 10f * sqrt(re[b] * re[b] + im[b] * im[b]))
-        val diff = mag - prevMag[b]
-        if (diff > 0) sum += diff
-        prevMag[b] = mag
-      }
-      flux[frame] = sum
-    }
-
-    // Subtract local mean so autocorrelation sees onsets, not slow dynamics.
-    val meanWindow = (0.5f * FFT_SIZE / HOP_SIZE * 8).roundToInt().coerceAtLeast(8)
-    val detrended = FloatArray(numFrames)
-    for (i in 0 until numFrames) {
-      val lo = max(0, i - meanWindow)
-      val hi = min(numFrames - 1, i + meanWindow)
-      var mean = 0f
-      for (j in lo..hi) mean += flux[j]
-      mean /= hi - lo + 1
-      detrended[i] = max(0f, flux[i] - mean)
-    }
-    return detrended
-  }
-
-  /**
-   * Autocorrelation over the beat-period lag range. Returns (periodInFrames, confidence), favoring
-   * candidates whose double period is also supported (down-weights half-period picks).
-   */
-  private fun estimateTempoPeriod(flux: FloatArray, frameRate: Float): Pair<Float, Float>? {
-    val minLag = (frameRate * 60f / MAX_BPM).roundToInt()
-    val maxLag = (frameRate * 60f / MIN_BPM).roundToInt()
-    if (flux.size < maxLag * 2) return null
-
-    val ac = FloatArray(maxLag + 1)
-    for (lag in minLag..maxLag) {
-      var sum = 0f
-      for (i in 0 until flux.size - lag) sum += flux[i] * flux[i + lag]
-      ac[lag] = sum / (flux.size - lag)
-    }
-
-    var mean = 0f
-    for (lag in minLag..maxLag) mean += ac[lag]
-    mean /= maxLag - minLag + 1
-    if (mean <= 0f) return null
-
-    var bestLag = -1
-    var bestScore = 0f
-    for (lag in minLag..maxLag) {
-      if (lag > minLag && lag < maxLag && (ac[lag] < ac[lag - 1] || ac[lag] < ac[lag + 1])) continue
-      var score = ac[lag]
-      // Reward candidates whose 2x lag also correlates (true beat vs half-beat).
-      val doubleLag = lag * 2
-      if (doubleLag <= maxLag) score += 0.5f * ac[doubleLag]
-      if (score > bestScore) {
-        bestScore = score
-        bestLag = lag
-      }
-    }
-    if (bestLag < 0) return null
-
-    // Parabolic interpolation around the peak for sub-frame period accuracy.
-    val refined =
-      if (bestLag in minLag + 1 until maxLag) {
-        val y0 = ac[bestLag - 1]
-        val y1 = ac[bestLag]
-        val y2 = ac[bestLag + 1]
-        val denom = y0 - 2 * y1 + y2
-        if (denom != 0f) bestLag + 0.5f * (y0 - y2) / denom else bestLag.toFloat()
-      } else bestLag.toFloat()
-
-    // Peak prominence over the median autocorrelation: flat (beatless) material
-    // scores near 0, a strong periodic pulse scores near 1.
-    val sortedAc = ac.copyOfRange(minLag, maxLag + 1).sorted()
-    val median = sortedAc[sortedAc.size / 2]
-    val confidence =
-      if (ac[bestLag] > 0f) ((ac[bestLag] - median) / ac[bestLag]).coerceIn(0f, 1f) else 0f
-    return refined to confidence
-  }
-
-  // Krumhansl-Schmuckler key profiles: relative pull of each scale degree on the tonic.
-  private val MAJOR_PROFILE =
-    floatArrayOf(6.35f, 2.23f, 3.48f, 2.33f, 4.38f, 4.09f, 2.52f, 5.19f, 2.39f, 3.66f, 2.29f, 2.88f)
-  private val MINOR_PROFILE =
-    floatArrayOf(6.33f, 2.68f, 3.52f, 5.38f, 2.60f, 3.53f, 2.54f, 4.75f, 3.98f, 2.69f, 3.34f, 3.17f)
-
-  /**
-   * Chroma vector (12-bin pitch-class energy) correlated against the Krumhansl-Schmuckler
-   * major/minor profiles across all 12 rotations. Returns (pitch class 0=C..11=B, isMinor), or null
-   * when there isn't enough tonal energy to call a key (e.g. mostly percussive).
-   */
-  private fun estimateKey(samples: FloatArray, sampleRate: Int): Pair<Int, Boolean>? {
-    if (samples.size < FFT_SIZE * 4) return null
-    val window = FloatArray(FFT_SIZE) { 0.5f - 0.5f * cos(2.0 * Math.PI * it / FFT_SIZE).toFloat() }
-    val hop = FFT_SIZE / 2
-    val numFrames = (samples.size - FFT_SIZE) / hop
-    if (numFrames < 4) return null
-
-    val chroma = FloatArray(12)
-    val re = FloatArray(FFT_SIZE)
-    val im = FloatArray(FFT_SIZE)
-    val binHz = sampleRate.toFloat() / FFT_SIZE
-    // Musically relevant range: skip sub-bass rumble and high-frequency noise.
-    val minBin = (65f / binHz).toInt().coerceAtLeast(1)
-    val maxBin = (2000f / binHz).toInt().coerceAtMost(FFT_SIZE / 2 - 1)
-
-    for (frame in 0 until numFrames) {
-      val offset = frame * hop
-      for (i in 0 until FFT_SIZE) {
-        re[i] = samples[offset + i] * window[i]
-        im[i] = 0f
-      }
-      fft(re, im)
-      for (b in minBin..maxBin) {
-        val mag = sqrt(re[b] * re[b] + im[b] * im[b])
-        if (mag <= 0f) continue
-        val freq = b * binHz
-        val midi = 69.0 + 12.0 * (ln(freq / 440.0) / ln(2.0))
-        val pitchClass = ((midi.roundToInt() % 12) + 12) % 12
-        chroma[pitchClass] += mag
-      }
-    }
-
-    val sum = chroma.sum()
-    if (sum <= 0f) return null
-    for (i in chroma.indices) chroma[i] /= sum
-
-    var bestScore = Float.NEGATIVE_INFINITY
-    var bestPitchClass = 0
-    var bestIsMinor = false
-    for (tonic in 0 until 12) {
-      val majorScore = correlateChroma(chroma, MAJOR_PROFILE, tonic)
-      if (majorScore > bestScore) {
-        bestScore = majorScore
-        bestPitchClass = tonic
-        bestIsMinor = false
-      }
-      val minorScore = correlateChroma(chroma, MINOR_PROFILE, tonic)
-      if (minorScore > bestScore) {
-        bestScore = minorScore
-        bestPitchClass = tonic
-        bestIsMinor = true
-      }
-    }
-    return bestPitchClass to bestIsMinor
-  }
-
-  private fun correlateChroma(chroma: FloatArray, profile: FloatArray, tonic: Int): Float {
-    var sum = 0f
-    for (degree in 0 until 12) sum += chroma[(degree + tonic) % 12] * profile[degree]
-    return sum
-  }
-
-  /** Comb filter: phase (in frames) maximizing summed flux at phase + k*period. */
-  private fun estimateBeatPhase(flux: FloatArray, periodFrames: Float): Float {
-    val period = periodFrames.roundToInt().coerceAtLeast(1)
-    var bestPhase = 0
-    var bestSum = -1f
-    for (phase in 0 until period) {
-      var sum = 0f
-      var i = phase
-      while (i < flux.size) {
-        sum += flux[i]
-        i += period
-      }
-      if (sum > bestSum) {
-        bestSum = sum
-        bestPhase = phase
-      }
-    }
-    return bestPhase.toFloat()
-  }
-
-  /** In-place iterative radix-2 FFT. Arrays must be a power-of-two length. */
-  private fun fft(re: FloatArray, im: FloatArray) {
-    val n = re.size
-    var j = 0
-    for (i in 1 until n) {
-      var bit = n shr 1
-      while (j and bit != 0) {
-        j = j xor bit
-        bit = bit shr 1
-      }
-      j = j or bit
-      if (i < j) {
-        val tr = re[i]
-        re[i] = re[j]
-        re[j] = tr
-        val ti = im[i]
-        im[i] = im[j]
-        im[j] = ti
-      }
-    }
-    var len = 2
-    while (len <= n) {
-      val ang = -2.0 * Math.PI / len
-      val wRe = cos(ang).toFloat()
-      val wIm = sin(ang).toFloat()
-      var i = 0
-      while (i < n) {
-        var curRe = 1f
-        var curIm = 0f
-        for (k in 0 until len / 2) {
-          val uRe = re[i + k]
-          val uIm = im[i + k]
-          val vRe = re[i + k + len / 2] * curRe - im[i + k + len / 2] * curIm
-          val vIm = re[i + k + len / 2] * curIm + im[i + k + len / 2] * curRe
-          re[i + k] = uRe + vRe
-          im[i + k] = uIm + vIm
-          re[i + k + len / 2] = uRe - vRe
-          im[i + k + len / 2] = uIm - vIm
-          val nRe = curRe * wRe - curIm * wIm
-          curIm = curRe * wIm + curIm * wRe
-          curRe = nRe
-        }
-        i += len
-      }
-      len = len shl 1
-    }
+    return MonoPcm(samples, sampleRate).takeIf { it.samples.size >= BeatDsp.FFT_SIZE * 8 }
   }
 }
