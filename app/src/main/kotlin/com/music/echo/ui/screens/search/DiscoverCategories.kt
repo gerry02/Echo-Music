@@ -274,7 +274,7 @@ fun DiscoverCategory.route(): String =
     "search/${java.net.URLEncoder.encode(searchQuery, "UTF-8")}"
   }
 
-private const val MOODS_AND_GENRES_CATEGORY = "FEmusic_moods_and_genres_category"
+const val MOODS_AND_GENRES_CATEGORY = "FEmusic_moods_and_genres_category"
 
 private fun Color.darken(fraction: Float): Color =
   Color(

@@ -15,7 +15,8 @@ import org.junit.Test
 /**
  * Fixtures are trimmed live `youtubei/v1/browse` responses (WEB_REMIX, hl=it, gl=IT), saved on
  * 2026-11-25: `FEmusic_charts` without formData, with `selectedValues=["US"]`, and
- * `FEmusic_moods_and_genres`.
+ * `FEmusic_moods_and_genres`, and the "Allenamento" (workout) `FEmusic_moods_and_genres_category`
+ * page.
  */
 class DiscoveryPagesTest {
 
@@ -107,5 +108,38 @@ class DiscoveryPagesTest {
         it.endpoint.browseId == "FEmusic_moods_and_genres_category" && !it.endpoint.params.isNullOrBlank()
       },
     )
+  }
+
+  @Test
+  fun moodPageGivesPlaylistsAndAnArtworkForItsCard() {
+    val result = BrowseResult.fromBrowseResponse(load("mood_workout_it.json"))
+
+    assertEquals("Allenamento", result.title)
+    assertEquals(5, result.items.size)
+    assertEquals("In palestra", result.items.first().title)
+    assertTrue(result.items.first().items.all { it is PlaylistItem })
+    // The moods list itself carries only a colour: the card borrows the first playlist cover.
+    val artwork = result.artworkUrl
+    assertNotNull(artwork)
+    assertEquals(result.items.first().items.first().thumbnail, artwork)
+    assertTrue(artwork!!.startsWith("https://"))
+  }
+
+  @Test
+  fun artworkIsNullWhenNoItemHasOne() {
+    assertEquals(null, BrowseResult(title = null, items = emptyList()).artworkUrl)
+  }
+
+  @Test
+  fun everyChartItemHasAThumbnail() {
+    for (name in listOf("charts_it.json", "charts_us.json")) {
+      val page = ChartsPage.fromBrowseResponse(load(name))
+      for (section in page.sections) {
+        assertTrue(
+          "$name / ${section.title}",
+          section.items.all { !it.thumbnail.isNullOrBlank() },
+        )
+      }
+    }
   }
 }

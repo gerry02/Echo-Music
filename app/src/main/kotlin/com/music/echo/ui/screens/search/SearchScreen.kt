@@ -52,6 +52,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
@@ -115,6 +116,7 @@ fun SearchScreen(
   val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
 
   val moodAndGenresList by moodAndGenresViewModel.moodAndGenres.collectAsState()
+  val categoryArtwork by moodAndGenresViewModel.artwork.collectAsState()
 
   var searchSource by rememberEnumPreference(SearchSourceKey, SearchSource.ONLINE)
   var query by
@@ -457,8 +459,18 @@ fun SearchScreen(
             }
             items(items = section.categories, key = { "${index}_${it.ytParams ?: it.title}" }) {
               category ->
+              val params = category.ytParams
+              if (category.imageUrl == null && params != null) {
+                LaunchedEffect(params) {
+                  moodAndGenresViewModel.loadArtwork(
+                    category.browseId ?: MOODS_AND_GENRES_CATEGORY,
+                    params,
+                  )
+                }
+              }
               DiscoverCategoryCard(
                 category = category,
+                imageUrl = category.imageUrl ?: params?.let { categoryArtwork[it] },
                 onClick = { navController.navigate(category.route()) },
               )
             }
@@ -516,6 +528,7 @@ fun DiscoverCategoryCard(
   category: DiscoverCategory,
   onClick: () -> Unit,
   modifier: Modifier = Modifier,
+  imageUrl: String? = category.imageUrl,
 ) {
   Box(
     modifier =
@@ -531,13 +544,25 @@ fun DiscoverCategoryCard(
         .clickable(onClick = onClick),
   ) {
     // Artist / Genre photo spanning the full card with a smooth gradient fade mask
-    category.imageUrl?.let { imageUrl ->
+    if (imageUrl != null) {
       AsyncImage(
         model = imageUrl,
         contentDescription = null,
         contentScale = ContentScale.Crop,
         alignment = Alignment.CenterEnd,
         modifier = Modifier.fillMaxSize(),
+      )
+    } else {
+      // No picture (yet): a large tilted note on the coloured tile, like a sticker.
+      Icon(
+        painter = painterResource(R.drawable.music_note),
+        contentDescription = null,
+        tint = Color.White.copy(alpha = 0.28f),
+        modifier =
+          Modifier.align(Alignment.CenterEnd)
+            .padding(end = 6.dp)
+            .size(76.dp)
+            .rotate(18f),
       )
     }
 
