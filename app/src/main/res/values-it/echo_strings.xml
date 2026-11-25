@@ -4,6 +4,7 @@
     <string name="local_history">Locale</string>
     <string name="remote_history">Remoto</string>
     <string name="charts">Classifiche</string>
+    <string name="charts_country">Paese delle classifiche</string>
     <string name="back_button_desc">Indietro</string>
     <string name="no_title">Nessun titolo</string>
     <string name="unknown_artist">Artista sconosciuto</string>

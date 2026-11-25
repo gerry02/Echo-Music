@@ -4,6 +4,7 @@ import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.asPaddingValues
 import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.GridItemSpan
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -13,6 +14,7 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
@@ -35,6 +37,7 @@ import echo.music.iad1tya.models.toMediaMetadata
 import echo.music.iad1tya.playback.queues.YouTubeQueue
 import echo.music.iad1tya.ui.component.IconButton
 import echo.music.iad1tya.ui.component.LocalMenuState
+import echo.music.iad1tya.ui.component.NavigationTitle
 import echo.music.iad1tya.ui.component.YouTubeGridItem
 import echo.music.iad1tya.ui.component.shimmer.GridItemPlaceHolder
 import echo.music.iad1tya.ui.component.shimmer.ShimmerHost
@@ -63,7 +66,16 @@ fun YouTubeBrowseScreen(
   val coroutineScope = rememberCoroutineScope()
   val gridItemSize by rememberEnumPreference(GridItemsSizeKey, GridItemSize.BIG)
 
-  val allItems = browseResult?.items?.flatMap { it.items } ?: emptyList()
+  // Sections (e.g. "Gym", "Cardio" on a mood page) with each item shown once, in its first one.
+  val sections =
+    remember(browseResult) {
+      val seen = HashSet<String>()
+      browseResult
+        ?.items
+        .orEmpty()
+        .map { section -> section.title to section.items.filter { seen.add(it.id) } }
+        .filter { (_, items) -> items.isNotEmpty() }
+    }
 
   LazyVerticalGrid(
     columns =
@@ -76,7 +88,13 @@ fun YouTubeBrowseScreen(
       items(8) { ShimmerHost { GridItemPlaceHolder(fillMaxWidth = true) } }
     }
 
-    items(items = allItems.distinctBy { it.id }, key = { it.id }) { item ->
+    sections.forEachIndexed { index, (title, sectionItems) ->
+    if (title != null && sections.size > 1) {
+      item(key = "section_$index", span = { GridItemSpan(maxLineSpan) }) {
+        NavigationTitle(title = title)
+      }
+    }
+    items(items = sectionItems, key = { it.id }) { item ->
       YouTubeGridItem(
         item = item,
         isActive =
@@ -137,6 +155,7 @@ fun YouTubeBrowseScreen(
             )
             .animateItem(),
       )
+    }
     }
   }
 

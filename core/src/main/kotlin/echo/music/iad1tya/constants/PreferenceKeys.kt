@@ -98,6 +98,10 @@ val AppLanguageKey = stringPreferencesKey("appLanguage")
 val ContentLanguageKey = stringPreferencesKey("contentLanguage")
 val ContentCountryKey = stringPreferencesKey("contentCountry")
 val SuggestionRegionKey = stringPreferencesKey("suggestionRegion")
+
+// Country of the Discover charts screen; unset follows the content country
+val ChartsCountryKey = stringPreferencesKey("chartsCountry")
+
 val EnableKugouKey = booleanPreferencesKey("enableKugou")
 val FetchFasterLyricsKey = booleanPreferencesKey("fetchFasterLyrics")
 

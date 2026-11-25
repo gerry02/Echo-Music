@@ -312,6 +312,7 @@ class InnerTube {
     params: String? = null,
     continuation: String? = null,
     setLogin: Boolean = false,
+    formData: BrowseBody.FormData? = null,
   ) = withRetry {
     val effectiveLogin = (setLogin || useLoginForBrowse) && !cookie.isNullOrEmpty()
     httpClient.post("browse") {
@@ -322,6 +323,7 @@ class InnerTube {
           browseId = browseId,
           params = params,
           continuation = continuation,
+          formData = formData,
         ),
       )
     }

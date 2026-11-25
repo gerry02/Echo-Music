@@ -9,4 +9,7 @@ data class BrowseBody(
   val browseId: String?,
   val params: String?,
   val continuation: String?,
-)
+  val formData: FormData? = null,
+) {
+  @Serializable data class FormData(val selectedValues: List<String>)
+}

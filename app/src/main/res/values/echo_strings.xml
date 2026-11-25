@@ -9,6 +9,7 @@
     <string name="remote_history">Remote</string>
 
     <string name="charts">Charts</string>
+    <string name="charts_country">Charts country</string>
     <string name="back_button_desc">Back</string>
     <string name="no_title">No title</string>
     <string name="unknown_artist">Unknown artist</string>
