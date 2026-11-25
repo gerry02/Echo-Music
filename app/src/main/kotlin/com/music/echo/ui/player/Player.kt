@@ -575,6 +575,20 @@ fun BottomSheetPlayer(
               .padding(6.dp),
         ) {
           Text("AUTOMIX  ${dbg.status}", style = mono, color = Color.White)
+          dbg.lastVerdict?.let { verdict ->
+            // How the last transition went: green beat match, amber smooth, red fallback.
+            val verdictColor =
+              when (dbg.lastVerdictLevel) {
+                echo.music.iad1tya.playback.MusicService.AutomixDebugInfo.VERDICT_BEAT_MATCH -> Color(0xFF69F0AE)
+                echo.music.iad1tya.playback.MusicService.AutomixDebugInfo.VERDICT_FALLBACK -> Color(0xFFFF5252)
+                else -> Color(0xFFFFD740)
+              }
+            Text(
+              "last: $verdict",
+              style = mono.copy(fontWeight = androidx.compose.ui.text.font.FontWeight.Bold),
+              color = verdictColor,
+            )
+          }
           Text(
             "out: ${dbg.outBpm?.let { "%.1f bpm".format(it) } ?: "—"}" +
               (dbg.outConfidence?.let { "  conf %.2f".format(it) } ?: "") +

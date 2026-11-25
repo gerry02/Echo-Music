@@ -25,7 +25,7 @@ import timber.log.Timber
 object BeatAnalyzer {
 
   /** Bumped when the analysis changes so stored rows are redone once. */
-  const val VERSION = 3
+  const val VERSION = 4
 
   data class Result(
     val bpm: Float,

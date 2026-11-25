@@ -406,6 +406,10 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
     android.util.Log.i("Automix", message)
   }
 
+  /** Songs analyzed again once this session because their end was never measured. */
+  private val tailRetried =
+    java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap<String, Boolean>())
+
   /** Songs analyzed from a file cut short in this session: not fetched again until restart. */
   private val partiallyAnalyzed = java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap<String, Boolean>())
 
@@ -443,7 +447,26 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
     val tempoRatio: Float? = null,
     /** Beat drift measured during the blend and corrected, in ms. */
     val phaseErrorMs: Long? = null,
-  )
+    /** How the last transition went, in words. */
+    val lastVerdict: String? = null,
+    /** [VERDICT_BEAT_MATCH], [VERDICT_SMOOTH] or [VERDICT_FALLBACK]. */
+    val lastVerdictLevel: Int = VERDICT_SMOOTH,
+  ) {
+    companion object {
+      const val VERDICT_BEAT_MATCH = 0
+      const val VERDICT_SMOOTH = 1
+      const val VERDICT_FALLBACK = 2
+    }
+  }
+
+  /** How the last transition went, kept across songs for the debug overlay. */
+  private var lastTransitionVerdict: Pair<String, Int>? = null
+
+  private fun reportVerdict(text: String, level: Int) {
+    lastTransitionVerdict = text to level
+    automixDebugInfo.value = automixDebugInfo.value?.copy(lastVerdict = text, lastVerdictLevel = level)
+    automixLog("result: $text")
+  }
 
   val automixDebugInfo = MutableStateFlow<AutomixDebugInfo?>(null)
 
@@ -5792,6 +5815,7 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
           prebuffered?.player?.let { p -> runCatching { if (p.playWhenReady) p.pause() } }
         }
       }
+      preRoll?.finish()
       preRollPhaseErrorMs = preRoll?.lastErrorMs
       if (
         isActive &&
@@ -5827,6 +5851,8 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
     val partialDebug =
       AutomixDebugInfo(
         status = "",
+        lastVerdict = lastTransitionVerdict?.first,
+        lastVerdictLevel = lastTransitionVerdict?.second ?: AutomixDebugInfo.VERDICT_SMOOTH,
         outBpm = outBeat?.bpm,
         outConfidence = outBeat?.confidence,
         outMixOutMs = outBeat?.mixOutPointMs,
@@ -5834,6 +5860,20 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
         inConfidence = inBeat?.confidence,
         inMixInMs = inBeat?.mixInPointMs,
       )
+    if (
+      outBeat != null &&
+        outBeat.bpm > 0f &&
+        outBeat.tailAnchorMs == null &&
+        outBeat.lastSoundMs == null &&
+        !currentId.isLocalMediaId() &&
+        !streamIsLossless(currentId) &&
+        tailRetried.add(currentId)
+    ) {
+      // Analyzed ahead (a lookahead fetch can fall short): now that it plays, measure its end.
+      automixLog("plan $currentId: its end was never measured, analyzing it again")
+      partiallyAnalyzed.remove(currentId)
+      maybeAnalyzeBeat(currentId, BeatAnalysisPriority.IMMEDIATE, force = true)
+    }
     if (outBeat == null) {
       automixDebugInfo.value = partialDebug.copy(status = "fallback: analysis pending (current)")
       automixLog("plan $currentId -> $nextId: plain crossfade, current song not analyzed yet")
@@ -6130,6 +6170,8 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
   private fun maybeAnalyzeBeat(
     mediaId: String,
     priority: BeatAnalysisPriority = BeatAnalysisPriority.IMMEDIATE,
+    /** Analyze again even when a current analysis is stored. */
+    force: Boolean = false,
   ) {
     synchronized(beatAnalysisJobs) {
       val existing = beatAnalysisJobs[mediaId]
@@ -6157,7 +6199,7 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
             }
           mutex.withLock {
             try {
-              runBeatAnalysis(mediaId, priority)
+              runBeatAnalysis(mediaId, priority, force)
             } catch (e: kotlinx.coroutines.CancellationException) {
               Timber.tag(TAG).d("Beat analysis cancelled for %s (%s)", mediaId, priority)
               throw e
@@ -6177,10 +6219,14 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
     }
   }
 
-  private suspend fun runBeatAnalysis(mediaId: String, priority: BeatAnalysisPriority) {
+  private suspend fun runBeatAnalysis(
+    mediaId: String,
+    priority: BeatAnalysisPriority,
+    force: Boolean = false,
+  ) {
     val existing = database.beatInfo(mediaId)
     // Rows of an older analysis are redone once: they lack the bars measured at the edges.
-    if (existing != null && existing.analysisVersion >= BeatAnalyzer.VERSION) return
+    if (!force && existing != null && existing.analysisVersion >= BeatAnalyzer.VERSION) return
     // Analyzed from a file cut short already in this session: wait for a later one.
     if (existing != null && mediaId in partiallyAnalyzed) return
     Timber.tag(TAG).d("Beat analysis starting for %s (%s)", mediaId, priority)
@@ -6617,11 +6663,13 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
       // Blend progress and outgoing position where a beat match lost the beat: from there what is
       // left of it plays out fast.
       var bailFrom: Pair<Float, Long>? = null
+      var bailReason: String? = null
       if (djPlan != null && djPlan.isBeatMatch && preRollError != null &&
         kotlin.math.abs(preRollError) > AutomixPlanner.MAX_BLEND_PHASE_ERROR_MS
       ) {
         bailFrom = 0f to djPlan.triggerTimeMs
-        automixLog("phase: still ${preRollError.toLong()} ms off after the pre-roll: short blend instead")
+        bailReason = "still ${preRollError.toLong()} ms off after the pre-roll"
+        reportVerdict("FALLBACK short blend: $bailReason", AutomixDebugInfo.VERDICT_FALLBACK)
       }
 
       fun waitWhilePaused(): Boolean = !player.isPlaying &&
@@ -6664,7 +6712,11 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
               inDuck?.setHighPass(mix.inHighPass)
             }
             if (bailFrom == null && progress < djPlan.transition.bassSwapAt) {
-              if (phaseLock?.step(outPos, progress) == true) bailFrom = progress to outPos
+              if (phaseLock?.step(outPos, progress) == true) {
+                bailFrom = progress to outPos
+                bailReason = phaseLock.bailReason
+                reportVerdict("FALLBACK short blend: ${phaseLock.bailReason}", AutomixDebugInfo.VERDICT_FALLBACK)
+              }
             }
             if (progress >= 1f) break
             delay(15)
@@ -6704,6 +6756,20 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
         phaseLock?.let { lock ->
           automixDebugInfo.value = automixDebugInfo.value?.copy(phaseErrorMs = lock.lastErrorMs)
         }
+        when {
+          bailReason != null -> Unit // reported when it gave up
+          djPlan == null ->
+            if (automixEnabled) {
+              reportVerdict("FALLBACK plain crossfade: no plan (song not analyzed yet)", AutomixDebugInfo.VERDICT_FALLBACK)
+            }
+          djPlan.isBeatMatch ->
+            reportVerdict(
+              "BEAT MATCH ok: ${djPlan.overlapMs / 1000} s blend, ${phaseLock?.lastErrorMs ?: "?"} ms from the beat",
+              AutomixDebugInfo.VERDICT_BEAT_MATCH,
+            )
+          else ->
+            reportVerdict("SMOOTH crossfade: ${djPlan.transition.reason.removePrefix("smooth: ")}", AutomixDebugInfo.VERDICT_SMOOTH)
+        }
         cleanupCrossfade()
         activeAutomixPlan = null
         if (djPlan != null && djPlan.transition.incomingSpeed != 1f) restoreTempo(djPlan)
@@ -6718,12 +6784,14 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
    * starts on the beat and the speed nudges during it stay tiny.
    */
   private inner class PreRoll(private val plan: AutomixPlan, private val pb: PrebufferedTransition) {
-    private var runningSinceMs = 0L
+    private val watch = echo.music.iad1tya.playback.crossfade.PositionWatch()
     private var nextCheckAtMs = 0L
     private var seeks = 0
     private var seekPending = false
     /** What a seek lands short by (the time it takes), learned from the previous one. */
     private var biasMs = 0.0
+    /** Speed on top of the plan's while it catches up, muted. */
+    private var factor = 1f
     /** Offset to the nearest beat at the last measurement; null until measured. */
     var lastErrorMs: Double? = null
       private set
@@ -6733,47 +6801,71 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
       try {
         if (!player.isPlaying) {
           if (p.playWhenReady) p.pause()
-          runningSinceMs = 0L
+          watch.reset()
           return
         }
         if (!p.playWhenReady) {
           p.volume = 0f
           p.play()
-          runningSinceMs = 0L
+          watch.reset()
           return
         }
         val now = android.os.SystemClock.elapsedRealtime()
-        if (!p.isPlaying) {
-          runningSinceMs = 0L
-          return
-        }
-        if (runningSinceMs == 0L) {
-          runningSinceMs = now
-          return
-        }
-        // Let its audio settle before judging it.
-        if (now - runningSinceMs < 200 || now < nextCheckAtMs) return
+        val position = p.currentPosition
+        // Just started or seeked, it reports where it was asked to start until its audio runs:
+        // judged only once its position moves with time.
+        if (!watch.steady(p.isPlaying, position, now) || now < nextCheckAtMs) return
         nextCheckAtMs = now + 100
         val expected = plan.incomingStartMs + (outPos - plan.triggerTimeMs) * plan.transition.incomingSpeed
-        val position = p.currentPosition
         val rawMs = position - expected
         lastErrorMs = AutomixPlanner.wrapPhaseError(rawMs.toDouble(), plan.transition.incomingBeatMs)
         if (seekPending) {
           seekPending = false
           biasMs -= rawMs
+          automixLog("pre-roll: ${rawMs.toLong()} ms off after the seek")
         }
-        if (kotlin.math.abs(rawMs) <= PRE_ROLL_TOLERANCE_MS || seeks >= MAX_PRE_ROLL_SEEKS) return
-        // Too close to the blend for a seek to settle: the blend's own lock takes it from here.
-        if (plan.triggerTimeMs - outPos < 350) return
-        val target = (position - rawMs + biasMs).toLong()
-        if (target < 0) return
-        automixLog("pre-roll: ${rawMs.toLong()} ms off, seek to $target ms (bias ${biasMs.toLong()} ms)")
-        p.seekTo(target)
-        seeks++
-        seekPending = true
-        runningSinceMs = 0L
+        val leftMs = plan.triggerTimeMs - outPos
+        // Far off: a seek, while there is time for it to settle and be measured again.
+        if (kotlin.math.abs(rawMs) > PRE_ROLL_SEEK_OVER_MS && seeks < MAX_PRE_ROLL_SEEKS && leftMs > 900) {
+          val target = (position - rawMs + biasMs).toLong()
+          if (target >= 0) {
+            setFactor(1f)
+            automixLog("pre-roll: ${rawMs.toLong()} ms off, seek to $target ms (seek cost guess ${biasMs.toLong()} ms)")
+            p.seekTo(target)
+            seeks++
+            seekPending = true
+            watch.reset()
+            return
+          }
+        }
+        // Close: muted, the speed may change a lot, so catch up by the blend with no seek.
+        val horizonMs = (leftMs - 150).coerceAtLeast(300L).toFloat()
+        val wanted =
+          if (kotlin.math.abs(rawMs) <= PRE_ROLL_TOLERANCE_MS) 1f
+          else (1f - rawMs / horizonMs).coerceIn(1f - PRE_ROLL_MAX_NUDGE, 1f + PRE_ROLL_MAX_NUDGE)
+        setFactor(Math.round(wanted * 200) / 200f)
       } catch (e: Exception) {
         Timber.tag(TAG).d(e, "Pre-roll step failed")
+      }
+    }
+
+    /** Back to the plan's speed as the blend starts. */
+    fun finish() {
+      automixLog("pre-roll: done, ${lastErrorMs?.toLong()} ms from the nearest beat, $seeks seeks")
+      setFactor(1f)
+    }
+
+    private fun setFactor(f: Float) {
+      if (f == factor) return
+      factor = f
+      try {
+        pb.player.playbackParameters =
+          PlaybackParameters(
+            plan.baseParameters.speed * plan.transition.incomingSpeed * f,
+            plan.baseParameters.pitch,
+          )
+      } catch (e: Exception) {
+        Timber.tag(TAG).d(e, "Pre-roll speed change failed")
       }
     }
   }
@@ -6792,13 +6884,19 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
     /** One quiet seek is allowed at the very start when there was no pre-roll. */
     private var mayStillSeek = !preRolled
     private val beatMs = plan.transition.incomingBeatMs
+    private val watch = echo.music.iad1tya.playback.crossfade.PositionWatch()
     var lastErrorMs: Long? = null
+      private set
+    /** Why it gave up the beat match, once it did. */
+    var bailReason: String? = null
       private set
 
     /** Returns true when the beat match must give up: the beats can't be lined up in time. */
     fun step(outPos: Long, progress: Float): Boolean {
       if (gaveUp) return false
       val now = android.os.SystemClock.elapsedRealtime()
+      val position = player.currentPosition
+      val steady = watch.steady(player.isPlaying, position, now)
       if (nudgeEndsAtMs != 0L && now >= nudgeEndsAtMs) {
         nudgeEndsAtMs = 0L
         setSpeed(plan.transition.incomingSpeed)
@@ -6807,11 +6905,11 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
       }
       if (nudgeEndsAtMs != 0L || now < nextCheckAtMs) return false
       nextCheckAtMs = now + 200
-      // Wait for the incoming song's audio to be running before judging it.
-      if (!player.isPlaying || outPos < plan.triggerTimeMs + (if (preRolled) 0 else 250)) return false
+      // Wait for the incoming song's audio to be running (its position moving) before judging it.
+      if (!steady || outPos < plan.triggerTimeMs) return false
       val speed = plan.transition.incomingSpeed
       val expected = plan.incomingStartMs + (outPos - plan.triggerTimeMs) * speed
-      val rawMs = player.currentPosition - expected
+      val rawMs = position - expected
       // A whole beat late still lands on the beat: only the offset to the nearest beat matters.
       val errorMs = AutomixPlanner.wrapPhaseError(rawMs.toDouble(), beatMs).toLong()
       automixLog(
@@ -6828,15 +6926,17 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
         // Seconds off: a stall, not latency. No beat match to save.
         gaveUp = true
         automixLog("phase: off by more than $PHASE_GIVE_UP_MS ms, a stall: short blend instead")
+        bailReason = "next song stalled (${rawMs.toLong()} ms off)"
         return true
       }
       // Still barely audible: one seek lines it up, the bars too, better than seconds of nudging.
       if (mayStillSeek) {
         mayStillSeek = false
-        if (progress < PHASE_SEEK_BEFORE && kotlin.math.abs(errorMs) > AutomixPlanner.MAX_BLEND_PHASE_ERROR_MS) {
-          val target = (player.currentPosition - rawMs).toLong()
+        if (progress < PHASE_SEEK_BEFORE && kotlin.math.abs(errorMs) > QUIET_SEEK_OVER_MS) {
+          val target = (position - rawMs + learnedStartLatencyMs * speed).toLong()
           if (target >= 0) {
             player.seekTo(target)
+            watch.reset()
             nextCheckAtMs = now + 500
             automixLog("phase: quiet seek to $target ms")
             return false
@@ -6847,12 +6947,13 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
         gaveUp = true
         setSpeed(speed)
         automixLog("phase: still $errorMs ms off once heard: short blend instead")
+        bailReason = "$errorMs ms off the beat once heard"
         return true
       }
       if (kotlin.math.abs(errorMs) > PHASE_DEADBAND_MS && nudges < MAX_PHASE_NUDGES) {
         // Absorb the offset at most 3 % faster or slower, a short nudge at a time.
         val correction = (-errorMs.toFloat() / PHASE_NUDGE_MS).coerceIn(-0.03f, 0.03f)
-        val nudgeMs = (kotlin.math.abs(errorMs) / kotlin.math.abs(correction)).toLong().coerceIn(200L, 1_500L)
+        val nudgeMs = (kotlin.math.abs(errorMs) / kotlin.math.abs(correction)).toLong().coerceIn(200L, 2_500L)
         setSpeed(speed * (1 + correction))
         nudgeEndsAtMs = now + nudgeMs
         nudges++
@@ -6980,8 +7081,14 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
     /** A pre-roll shorter than this (a song started near its beginning) is not worth it. */
     private const val MIN_PRE_ROLL_MS = 800f
     /** Beat offset the pre-roll stops correcting at. */
-    private const val PRE_ROLL_TOLERANCE_MS = 8.0
-    private const val MAX_PRE_ROLL_SEEKS = 4
+    private const val PRE_ROLL_TOLERANCE_MS = 6.0
+    /** Offset from which the pre-roll seeks instead of catching up with the speed. */
+    private const val PRE_ROLL_SEEK_OVER_MS = 150.0
+    private const val MAX_PRE_ROLL_SEEKS = 3
+    /** Largest change of speed while muted. */
+    private const val PRE_ROLL_MAX_NUDGE = 0.12f
+    /** Offset from which the blend's lock seeks at its quiet start. */
+    private const val QUIET_SEEK_OVER_MS = 30.0
     private const val CACHE_SOURCE_ADDON = "addon"
     private const val CACHE_SOURCE_YOUTUBE = "youtube"
     /** A saved episode position is applied only while the episode is still at its start. */

@@ -58,11 +58,11 @@ class AutomixPlannerTest {
 
   @Test
   fun incomingIntroPlaysUnderTheOutroAndItsBodyArrivesAsTheBlendEnds() {
-    val incoming = track(bpm = 120f, mixIn = 16_250)
+    val incoming = track(bpm = 120f, mixIn = 20_250)
     val plan = AutomixPlanner.plan(track(), incoming, positionMs = 60_000, fadeMs = 5_000)!!
     assertEquals(Style.BEAT_MATCH, plan.style)
-    // 16 s blend at speed 1: the incoming body (16.25 s) lands at the blend end.
-    assertEquals(16_250L - plan.overlapMs, plan.incomingStartMs)
+    // 16 s blend at speed 1: the incoming body (20.25 s) lands at the blend end.
+    assertEquals(20_250L - plan.overlapMs, plan.incomingStartMs)
     assertOnGrid(plan.incomingStartMs, 250.0, 2000.0)
   }
 
@@ -261,11 +261,23 @@ class AutomixPlannerTest {
     assertFalse(AutomixPlanner.shouldBail(20.0, 0.5f))
     assertFalse(AutomixPlanner.shouldBail(-150.0, 0.05f))
     assertTrue(AutomixPlanner.shouldBail(-150.0, AutomixPlanner.PHASE_AUDIBLE_AT))
-    assertTrue(AutomixPlanner.shouldBail(31.0, 0.3f))
+    assertFalse(AutomixPlanner.shouldBail(45.0, 0.3f)) // the phone's 45 ms: nudged, not dropped
+    assertTrue(AutomixPlanner.shouldBail(75.0, 0.3f))
     // The rest of the blend then takes at most BAIL_BLEND_MS.
     assertEquals(0.3f, AutomixPlanner.bailProgress(0.3f, 0), 1e-6f)
     assertEquals(0.55f, AutomixPlanner.bailProgress(0.3f, AutomixPlanner.BAIL_BLEND_MS / 4), 1e-4f)
     assertEquals(1f, AutomixPlanner.bailProgress(0.3f, AutomixPlanner.BAIL_BLEND_MS), 0f)
+  }
+
+  @Test
+  fun theIncomingStartLeavesRoomForTheMutedPreRoll() {
+    // A next song whose intro starts right away: it starts on a later bar, still on its grid.
+    val next = track(mixIn = null, firstSound = 0)
+    val plan = AutomixPlanner.plan(track(), next, positionMs = 60_000, fadeMs = 5_000)!!
+    assertEquals(Style.BEAT_MATCH, plan.style)
+    assertTrue("starts at ${plan.incomingStartMs}", plan.incomingStartMs >= AutomixPlanner.PRE_ROLL_ROOM_MS)
+    assertTrue(plan.incomingStartMs < AutomixPlanner.PRE_ROLL_ROOM_MS + 2_000)
+    assertOnGrid(plan.incomingStartMs, 250.0, 2_000.0)
   }
 
   @Test

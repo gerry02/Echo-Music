@@ -41,12 +41,23 @@ object AutomixPlanner {
   const val MAX_MIX_IN_MS = 45_000L
   private const val MAX_MIX_IN_SHARE = 0.2
 
-  /** Beat offset left between the two songs from which a beat-matched blend is not kept. */
-  const val MAX_BLEND_PHASE_ERROR_MS = 30.0
+  /**
+   * Beat offset left between the two songs from which a beat-matched blend is not kept: below it a
+   * gentle nudge of speed still lines them up before it is noticed.
+   */
+  const val MAX_BLEND_PHASE_ERROR_MS = 70.0
+  /**
+   * Room left before the incoming start (its own ms) for the muted pre-roll that lines it up: a
+   * song started at its very first bar has none, so it starts a bar or two later instead.
+   */
+  const val PRE_ROLL_ROOM_MS = 2_700.0
   /** Blend progress from which the incoming song is clearly heard: phase must be right by then. */
   const val PHASE_AUDIBLE_AT = 0.12f
-  /** How long a blend that lost the beat takes to finish from where it is (0 -> 1). */
-  const val BAIL_BLEND_MS = 4_000L
+  /**
+   * How long a blend that lost the beat takes to finish from where it is (0 -> 1): quicker than the
+   * planned blend, so two songs off the beat don't overlap for long, but still a smooth fade.
+   */
+  const val BAIL_BLEND_MS = 8_000L
 
   data class Track(
     val bpm: Float,
@@ -258,9 +269,12 @@ object AutomixPlanner {
 
     val overlapMs = beats * outPeriod
     // The incoming body arrives as the blend ends: start its intro that many beats earlier.
-    val incomingStart =
+    var incomingStart =
       incoming.trustedMixInMs?.let { (it - beats * inPeriod).coerceAtLeast(inFirstBar) }
         ?.coerceAtMost(MAX_MIX_IN_MS.toDouble()) ?: inFirstBar
+    // Whole bars later when the pre-roll would have no room: the first bar or two play under the
+    // outgoing outro, thinned and quiet, so starting on a later downbeat loses nothing heard.
+    if (incomingStart < PRE_ROLL_ROOM_MS) incomingStart = snapUp(PRE_ROLL_ROOM_MS, incoming.headBars, inBar)
 
     // Swap the basslines on a phrase boundary near the middle: 4 bars into an 8-bar blend.
     val phrase = if (beats >= 32) 16 else if (beats >= 16) 8 else 4
