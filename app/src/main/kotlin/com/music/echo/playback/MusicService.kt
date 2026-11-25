@@ -417,7 +417,16 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
    * How long an incoming player takes from play() to sound, learned from the phase lock's first
    * measurement of each blend.
    */
-  @Volatile private var learnedStartLatencyMs = 120L
+  private var learnedStartLatencyMs: Long = -1L
+    get() {
+      if (field < 0) field = automixTimingPrefs.getLong("startLatencyMs", 500L)
+      return field
+    }
+    set(value) {
+      field = value.coerceIn(0L, MAX_START_LATENCY_MS)
+      automixTimingPrefs.edit().putLong("startLatencyMs", field).apply()
+    }
+  private val automixTimingPrefs by lazy { getSharedPreferences("automix_timing", MODE_PRIVATE) }
 
   /** Returns the incoming player to the user's tempo after a stretched blend. */
   private var tempoRestoreJob: Job? = null
@@ -5799,7 +5808,8 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
           val pb = prebuffered
           if (pb != null && pb.plan === plan && pb.player.playbackState == Player.STATE_READY) {
             val leadMs = (plan.incomingStartMs - pb.startMs) / plan.transition.incomingSpeed
-            if (leadMs >= MIN_PRE_ROLL_MS && triggerTime - position <= leadMs) {
+            // play() its usual start-up latency early, so it sounds from its start position on time.
+            if (leadMs >= MIN_PRE_ROLL_MS && triggerTime - position <= leadMs + learnedStartLatencyMs) {
               preRoll = PreRoll(plan, pb)
               automixLog("pre-roll: next song starts muted ${triggerTime - position} ms ahead of the blend")
             }
@@ -5807,7 +5817,11 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
         }
         preRoll?.step(position)
         // Fine polling near the trigger: a blend on the beat must start within a few ms.
-        delay(minOf(remaining, if (preRoll != null) 20L else if (remaining < 400) 5L else 100L))
+        val preRollSoon =
+          plan?.isBeatMatch == true &&
+            preRoll == null &&
+            triggerTime - position < PRE_ROLL_MS + learnedStartLatencyMs + 600
+        delay(minOf(remaining, if (preRoll != null) 20L else if (remaining < 400 || preRollSoon) 5L else 100L))
       }
       } finally {
         // Not adopted by a blend (cancelled, song changed): the pre-rolled player stops sounding.
@@ -5907,6 +5921,7 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
         incoming = inTrack,
         positionMs = player.currentPosition,
         fadeMs = crossfadeDuration.toLong(),
+        beatSync = AUTOMIX_BEAT_SYNC,
       )
     if (transition == null) {
       automixDebugInfo.value = partialDebug.copy(status = "fallback: trigger out of range")
@@ -6785,11 +6800,16 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
    */
   private inner class PreRoll(private val plan: AutomixPlan, private val pb: PrebufferedTransition) {
     private val watch = echo.music.iad1tya.playback.crossfade.PositionWatch()
+    private val speed = plan.transition.incomingSpeed
+    /** How early play() was called, to sound on time: the start-up latency guess. */
+    private val startedEarlyMs = learnedStartLatencyMs
+    private var latencyMeasured = false
     private var nextCheckAtMs = 0L
     private var seeks = 0
-    private var seekPending = false
-    /** What a seek lands short by (the time it takes), learned from the previous one. */
-    private var biasMs = 0.0
+    /** Latency the last seek was compensated for, until its result is measured. */
+    private var seekAssumedMs: Long? = null
+    /** What a seek costs here (flush and restart of its audio), measured. */
+    private var seekCostMs: Long? = null
     /** Speed on top of the plan's while it catches up, muted. */
     private var factor = 1f
     /** Offset to the nearest beat at the last measurement; null until measured. */
@@ -6816,30 +6836,43 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
         // judged only once its position moves with time.
         if (!watch.steady(p.isPlaying, position, now) || now < nextCheckAtMs) return
         nextCheckAtMs = now + 100
-        val expected = plan.incomingStartMs + (outPos - plan.triggerTimeMs) * plan.transition.incomingSpeed
+        val expected = plan.incomingStartMs + (outPos - plan.triggerTimeMs) * speed
         val rawMs = position - expected
         lastErrorMs = AutomixPlanner.wrapPhaseError(rawMs.toDouble(), plan.transition.incomingBeatMs)
-        if (seekPending) {
-          seekPending = false
-          biasMs -= rawMs
-          automixLog("pre-roll: ${rawMs.toLong()} ms off after the seek")
+        if (!latencyMeasured) {
+          // It was started [startedEarlyMs] early: what is left over is the guess's error.
+          latencyMeasured = true
+          val observed = (startedEarlyMs - rawMs / speed).toLong()
+          automixLog("pre-roll: sounded $observed ms after play() (guess $startedEarlyMs ms), ${rawMs.toLong()} ms off")
+          if (observed in 0L..MAX_START_LATENCY_MS) {
+            learnedStartLatencyMs = (startedEarlyMs + observed) / 2 + (observed - startedEarlyMs) / 4
+          }
+        }
+        seekAssumedMs?.let { assumed ->
+          seekAssumedMs = null
+          val cost = (assumed - rawMs / speed).toLong()
+          seekCostMs = cost.coerceIn(0L, MAX_START_LATENCY_MS)
+          automixLog("pre-roll: ${rawMs.toLong()} ms off after the seek (it cost $cost ms)")
         }
         val leftMs = plan.triggerTimeMs - outPos
-        // Far off: a seek, while there is time for it to settle and be measured again.
-        if (kotlin.math.abs(rawMs) > PRE_ROLL_SEEK_OVER_MS && seeks < MAX_PRE_ROLL_SEEKS && leftMs > 900) {
-          val target = (position - rawMs + biasMs).toLong()
+        // Far off: a seek, ahead by what a seek costs here, while there is time to check it.
+        if (kotlin.math.abs(rawMs) > PRE_ROLL_SEEK_OVER_MS && seeks < MAX_PRE_ROLL_SEEKS && leftMs > 1_200) {
+          val assumed = seekCostMs ?: learnedStartLatencyMs
+          val target = (position - rawMs + assumed * speed).toLong()
           if (target >= 0) {
             setFactor(1f)
-            automixLog("pre-roll: ${rawMs.toLong()} ms off, seek to $target ms (seek cost guess ${biasMs.toLong()} ms)")
+            automixLog("pre-roll: ${rawMs.toLong()} ms off, seek to $target ms (seek cost guess $assumed ms)")
             p.seekTo(target)
             seeks++
-            seekPending = true
+            seekAssumedMs = assumed
             watch.reset()
             return
           }
         }
         // Close: muted, the speed may change a lot, so catch up by the blend with no seek.
-        val horizonMs = (leftMs - 150).coerceAtLeast(300L).toFloat()
+        // Aim to be on time a little before the blend; never steer harder than the audio buffered
+        // ahead of the speed change lets it see the result.
+        val horizonMs = (leftMs - 300).coerceAtLeast(800L).toFloat()
         val wanted =
           if (kotlin.math.abs(rawMs) <= PRE_ROLL_TOLERANCE_MS) 1f
           else (1f - rawMs / horizonMs).coerceIn(1f - PRE_ROLL_MAX_NUDGE, 1f + PRE_ROLL_MAX_NUDGE)
@@ -6918,7 +6951,7 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
       )
       if (lastErrorMs == null && !preRolled && kotlin.math.abs(rawMs) < beatMs / 2) {
         // Behind = it took longer to start than assumed: start earlier next time.
-        learnedStartLatencyMs = (learnedStartLatencyMs - rawMs.toLong() / 2).coerceIn(0L, 600L)
+        learnedStartLatencyMs = learnedStartLatencyMs - rawMs.toLong() / 2
       }
       lastErrorMs = errorMs
       automixDebugInfo.value = automixDebugInfo.value?.copy(phaseErrorMs = errorMs)
@@ -7064,6 +7097,8 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
     /** Waiting for data this soon after a seek or a track change is not a stall. */
     private const val STALL_GRACE_MS = 3_000L
     private const val CACHE_SOURCE_KEY = "echo-source"
+    /** Beat-matched blends between the two players (off: filtered blends only). */
+    private const val AUTOMIX_BEAT_SYNC = true
     /** How many of the next songs "Pick the best next song" chooses from. */
     private const val BEST_NEXT_CANDIDATES = 4
     /** Beat offset the automix phase lock leaves alone, in ms. */
@@ -7077,16 +7112,22 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
     /** Blend progress until which the incoming song is quiet enough for a lining-up seek. */
     private const val PHASE_SEEK_BEFORE = 0.08f
     /** How long (outgoing time) a beat-matched song plays muted before the blend, to line it up. */
-    private const val PRE_ROLL_MS = 2_500f
+    private const val PRE_ROLL_MS = 6_000f
+    /** Longest start-up latency believed for a player (beyond it, a stall). */
+    private const val MAX_START_LATENCY_MS = 1_500L
     /** A pre-roll shorter than this (a song started near its beginning) is not worth it. */
     private const val MIN_PRE_ROLL_MS = 800f
     /** Beat offset the pre-roll stops correcting at. */
     private const val PRE_ROLL_TOLERANCE_MS = 6.0
-    /** Offset from which the pre-roll seeks instead of catching up with the speed. */
-    private const val PRE_ROLL_SEEK_OVER_MS = 150.0
-    private const val MAX_PRE_ROLL_SEEKS = 3
+    /**
+     * Offset from which the pre-roll seeks instead of catching up with the speed. A seek costs an
+     * unknown, device-dependent time (its audio restarts); the speed works the same on any phone,
+     * so it does all it can: up to [PRE_ROLL_MAX_NUDGE] over the pre-roll.
+     */
+    private const val PRE_ROLL_SEEK_OVER_MS = 600.0
+    private const val MAX_PRE_ROLL_SEEKS = 2
     /** Largest change of speed while muted. */
-    private const val PRE_ROLL_MAX_NUDGE = 0.12f
+    private const val PRE_ROLL_MAX_NUDGE = 0.15f
     /** Offset from which the blend's lock seeks at its quiet start. */
     private const val QUIET_SEEK_OVER_MS = 30.0
     private const val CACHE_SOURCE_ADDON = "addon"

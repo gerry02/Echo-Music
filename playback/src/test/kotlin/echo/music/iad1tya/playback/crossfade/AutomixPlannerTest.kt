@@ -58,11 +58,11 @@ class AutomixPlannerTest {
 
   @Test
   fun incomingIntroPlaysUnderTheOutroAndItsBodyArrivesAsTheBlendEnds() {
-    val incoming = track(bpm = 120f, mixIn = 20_250)
+    val incoming = track(bpm = 120f, mixIn = 26_250)
     val plan = AutomixPlanner.plan(track(), incoming, positionMs = 60_000, fadeMs = 5_000)!!
     assertEquals(Style.BEAT_MATCH, plan.style)
-    // 16 s blend at speed 1: the incoming body (20.25 s) lands at the blend end.
-    assertEquals(20_250L - plan.overlapMs, plan.incomingStartMs)
+    // 16 s blend at speed 1: the incoming body (26.25 s) lands at the blend end.
+    assertEquals(26_250L - plan.overlapMs, plan.incomingStartMs)
     assertOnGrid(plan.incomingStartMs, 250.0, 2000.0)
   }
 
@@ -101,7 +101,7 @@ class AutomixPlannerTest {
     assertEquals(Style.SMOOTH, plan.style)
     assertEquals(1f, plan.incomingSpeed)
     assertEquals(182_250L, plan.triggerMs)
-    assertEquals(6_000L, plan.overlapMs)
+    assertEquals(AutomixPlanner.FILTERED_BLEND_MS, plan.overlapMs) // two beats: the long filtered blend
   }
 
   @Test
@@ -238,6 +238,30 @@ class AutomixPlannerTest {
     val mid = AutomixPlanner.mixAt(long, 0.5f + 2f / 32f)
     assertEquals(0.5f, mid.outBassCut, 0.05f)
     assertEquals(0.5f, mid.inBassCut, 0.05f)
+  }
+
+  @Test
+  fun withoutBeatSyncTwoBeatSongsGetALongFilteredBlendOnABar() {
+    val plan =
+      AutomixPlanner.plan(track(), track(bpm = 122f), positionMs = 60_000, fadeMs = 5_000, beatSync = false)!!
+    assertEquals(Style.SMOOTH, plan.style)
+    assertTrue(plan.filters)
+    assertTrue("${plan.overlapMs}", plan.overlapMs >= AutomixPlanner.FILTERED_BLEND_MS)
+    assertEquals(1f, plan.incomingSpeed, 0f)
+    // In the outro, on a bar, and over before the song ends.
+    assertOnGrid(plan.triggerMs, 250.0, 2_000.0)
+    assertTrue(plan.triggerMs >= 140_000)
+    assertTrue(plan.triggerMs + plan.overlapMs <= 199_700)
+    // One bassline at a time: swapped in the middle.
+    assertEquals(0f, AutomixPlanner.mixAt(plan, 0.2f).outBassCut, 0.001f)
+    assertEquals(1f, AutomixPlanner.mixAt(plan, 0.2f).inBassCut, 0.001f)
+    assertEquals(1f, AutomixPlanner.mixAt(plan, 0.8f).outBassCut, 0.001f)
+    assertEquals(0f, AutomixPlanner.mixAt(plan, 0.8f).inBassCut, 0.001f)
+    // A ballad keeps the user's fade, unfiltered.
+    val ballad =
+      AutomixPlanner.plan(track(confidence = 0f), track(), 60_000, 5_000, beatSync = false)!!
+    assertEquals(5_000L, ballad.overlapMs)
+    assertFalse(ballad.filters)
   }
 
   @Test

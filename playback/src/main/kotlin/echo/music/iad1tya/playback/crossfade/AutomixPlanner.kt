@@ -50,7 +50,7 @@ object AutomixPlanner {
    * Room left before the incoming start (its own ms) for the muted pre-roll that lines it up: a
    * song started at its very first bar has none, so it starts a bar or two later instead.
    */
-  const val PRE_ROLL_ROOM_MS = 2_700.0
+  const val PRE_ROLL_ROOM_MS = 6_500.0
   /** Blend progress from which the incoming song is clearly heard: phase must be right by then. */
   const val PHASE_AUDIBLE_AT = 0.12f
   /**
@@ -173,19 +173,30 @@ object AutomixPlanner {
         if (style == Style.BEAT_MATCH) overlapMs.toDouble() * beatFraction * incomingSpeed else 0.0
   }
 
+  /** Length of the filtered blend between two songs with a beat that are not beat-synced. */
+  const val FILTERED_BLEND_MS = 8_000L
+
   /**
    * @param positionMs where the outgoing song is now: a plan never starts in the past.
    * @param fadeMs the user's crossfade length, used by the smooth style.
+   * @param beatSync whether a beat-matched blend may be planned: off, two songs with a beat get a
+   *   filtered blend of at least [FILTERED_BLEND_MS] on the outgoing bar grid instead.
    */
-  fun plan(out: Track, incoming: Track?, positionMs: Long, fadeMs: Long): Plan? {
+  fun plan(
+    out: Track,
+    incoming: Track?,
+    positionMs: Long,
+    fadeMs: Long,
+    beatSync: Boolean = true,
+  ): Plan? {
     val earliest = positionMs + 1_000
-    if (incoming != null && out.hasBeat && incoming.hasBeat) {
+    if (beatSync && incoming != null && out.hasBeat && incoming.hasBeat) {
       val ratio = foldRatio(out.bpm / incoming.bpm)
       if (abs(ratio - 1f) <= MAX_TEMPO_CHANGE) {
         beatMatch(out, incoming, ratio, earliest)?.let { return it }
       }
     }
-    return smooth(out, incoming, earliest, fadeMs)
+    return smooth(out, incoming, earliest, fadeMs, beatSync)
   }
 
   /** Tempo ratio folded by octaves (a 70 BPM song against a 140 BPM one is a 1:1 match). */
@@ -294,8 +305,17 @@ object AutomixPlanner {
     )
   }
 
-  private fun smooth(out: Track, incoming: Track?, earliest: Long, fadeMs: Long): Plan? {
-    val fade = fadeMs.coerceIn(2_000L, 12_000L).toDouble()
+  private fun smooth(
+    out: Track,
+    incoming: Track?,
+    earliest: Long,
+    fadeMs: Long,
+    beatSync: Boolean = true,
+  ): Plan? {
+    val bothBeat = incoming != null && out.hasBeat && incoming.hasBeat
+    // Two songs with drums blend longer: the filters keep them from clashing while they overlap.
+    val fade =
+      (if (bothBeat) maxOf(fadeMs, FILTERED_BLEND_MS) else fadeMs).coerceIn(2_000L, 12_000L).toDouble()
     val hardEnd = (out.durationMs - END_MARGIN_MS).toDouble()
     val audibleEnd = out.audibleEndMs
     var trigger =
@@ -315,10 +335,11 @@ object AutomixPlanner {
       incomingStartMs = incoming?.trustedFirstSoundMs?.coerceIn(0L, 10_000L) ?: 0L,
       overlapMs = overlap.roundToLong(),
       // Two beats that do not line up clash least with the drums of each thinned in turn.
-      filters = incoming != null && out.hasBeat && incoming.hasBeat,
+      filters = bothBeat,
       reason = when {
         incoming == null -> "smooth: next not analyzed"
         !out.hasBeat || !incoming.hasBeat -> "smooth: no clear beat"
+        !beatSync -> "smooth: filtered blend (beat sync off)"
         else -> "smooth: tempos too far apart"
       },
     )
@@ -358,9 +379,14 @@ object AutomixPlanner {
     if (plan.style == Style.SMOOTH) {
       val g = EqualPowerCurve.calculateGains(p)
       if (!plan.filters) return Mix(g.outgoingGain, g.incomingGain)
+      // One bassline at a time, handed over in the middle; the incoming song comes in thin and
+      // fills out, the outgoing one leaves dull: their drums never stack at full range.
+      val swap = smoothstep(ramp(p, 0.4f, 0.6f))
       return Mix(
         outGain = g.outgoingGain,
         inGain = g.incomingGain,
+        outBassCut = swap,
+        inBassCut = 1f - swap,
         outLowPass = 0.8f * smoothstep(ramp(p, 0.3f, 1f)),
         inHighPass = 0.5f * (1f - smoothstep(ramp(p, 0f, 0.6f))),
       )
