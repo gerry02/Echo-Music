@@ -273,6 +273,9 @@ object AutomixPlanner {
     val inBassCut: Float = 0f,
     /** High-pass sweep on the outgoing song, 0 (open) .. 1 (thin, ~900 Hz). */
     val outHighPass: Float = 0f,
+    /** Low-pass sweep on the outgoing song, 0 (open) .. 1 (dull, ~700 Hz): its hi-hats and
+     *  sibilance leave instead of piling onto the incoming song's. */
+    val outLowPass: Float = 0f,
     /** High-pass on the incoming song, 0 (open) .. 1 (thin). */
     val inHighPass: Float = 0f,
   )
@@ -288,7 +291,7 @@ object AutomixPlanner {
       return Mix(
         outGain = g.outgoingGain,
         inGain = g.incomingGain,
-        outHighPass = 0.7f * smoothstep(ramp(p, 0.3f, 1f)),
+        outLowPass = 0.8f * smoothstep(ramp(p, 0.3f, 1f)),
         inHighPass = 0.5f * (1f - smoothstep(ramp(p, 0f, 0.6f))),
       )
     }
@@ -309,7 +312,9 @@ object AutomixPlanner {
       inGain = inGain,
       outBassCut = swap,
       inBassCut = 1f - swap,
-      outHighPass = smoothstep(ramp(p, plan.bassSwapAt, 1f)),
+      // After the swap the outgoing song keeps no bass (shelf) and loses its highs (low-pass):
+      // what fades out last is its mids, which mask least.
+      outLowPass = smoothstep(ramp(p, plan.bassSwapAt, 1f)),
       inHighPass = IN_HIGH_PASS * (1f - swap),
     )
   }

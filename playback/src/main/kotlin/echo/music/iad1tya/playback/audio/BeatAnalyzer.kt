@@ -51,6 +51,8 @@ object BeatAnalyzer {
     val lastSoundMs: Long? = null,
     /** Length of the analyzed audio, to tell another edit of the song apart. */
     val durationMs: Long = 0L,
+    /** How the beat phase was chosen, for the log. */
+    val phaseNote: String = "",
   )
 
   /** Decoded parts of a song, positions in ms from its start. */
@@ -83,6 +85,9 @@ object BeatAnalyzer {
 
   /** Comb strength from which a window has a beat of its own (1 = none). */
   private const val MIN_LOCAL_BEAT_STRENGTH = 1.3f
+
+  /** Beat vs offbeat margin below which the beat is not trusted for a beat-matched mix. */
+  private const val MIN_HALF_BEAT_MARGIN = 0.04
 
   /** Bar-phase confidence from which a window's own downbeat beats the middle grid's. */
   private const val LOCAL_BAR_CONFIDENCE = 0.2f
@@ -323,10 +328,7 @@ object BeatAnalyzer {
     if (midSpectrum != null) {
       val periodFrames = midSpectrum.msToFrame(periodMs)
       val comb = BeatDsp.beatPhase(midSpectrum.flux, periodFrames) ?: return null
-      val phase = BeatDsp.onBeatPhase(midSpectrum, comb.phaseFrames, periodFrames)
-      midBeatMs = windows.middleStartMs + midSpectrum.frameToMs(phase)
-      val bar = BeatDsp.downbeatPhase(midSpectrum, phase, periodFrames)
-      midDownbeatMs = midBeatMs + (bar?.first ?: 0) * periodMs
+      midBeatMs = windows.middleStartMs + midSpectrum.frameToMs(comb.phaseFrames)
     }
     val key = midSpectrum?.let { BeatDsp.key(it) }
 
@@ -336,8 +338,7 @@ object BeatAnalyzer {
       val periodFrames = spectrum.msToFrame(periodMs)
       val comb = BeatDsp.beatPhase(spectrum.flux, periodFrames) ?: return null
       if (comb.strength < MIN_LOCAL_BEAT_STRENGTH) return null
-      val phase = BeatDsp.onBeatPhase(spectrum, comb.phaseFrames, periodFrames)
-      return LocalGrid(startMs + spectrum.frameToMs(phase), spectrum, startMs)
+      return LocalGrid(startMs + spectrum.frameToMs(comb.phaseFrames), spectrum, startMs)
     }
     var headGrid = local(headSpectrum, windows.headStartMs)
     var tailGrid = local(tailSpectrum, windows.tailStartMs)
@@ -356,15 +357,62 @@ object BeatAnalyzer {
       }
     }
 
+    // Beat or offbeat: one decision for the whole song, every window voting on the same grid, so
+    // the start and the end can never sit half a beat apart from each other.
+    val reference = midBeatMs ?: headGrid?.beatMs ?: tailGrid?.beatMs
+    var phaseNote = ""
+    if (reference != null) {
+      // Each window's beat on the reference grid's side (a comb may have locked on the offbeat).
+      fun aligned(beatMs: Double): Double {
+        val rel = positiveMod(beatMs - reference, periodMs)
+        return if (rel > periodMs / 4 && rel < periodMs * 3 / 4) beatMs - periodMs / 2 else beatMs
+      }
+      var onBeat = 0.0
+      var offBeat = 0.0
+      val votes = ArrayList<String>()
+      fun vote(name: String, spectrum: BeatDsp.Spectrum?, startMs: Long, beatMs: Double?) {
+        if (spectrum == null || beatMs == null) return
+        val (a, b) =
+          BeatDsp.halfBeatScores(
+            spectrum,
+            spectrum.msToFrame(positiveMod(aligned(beatMs) - startMs, periodMs)),
+            spectrum.msToFrame(periodMs),
+          )
+        onBeat += a
+        offBeat += b
+        votes += "%s %.2f/%.2f".format(name, a, b)
+      }
+      vote("mid", midSpectrum, windows.middleStartMs, midBeatMs)
+      vote("head", headGrid?.spectrum, windows.headStartMs, headGrid?.beatMs)
+      vote("tail", tailGrid?.spectrum, windows.tailStartMs, tailGrid?.beatMs)
+      val shift = if (offBeat > onBeat * 1.05) periodMs / 2 else 0.0
+      val margin = if (onBeat + offBeat > 0) abs(onBeat - offBeat) / (onBeat + offBeat) else 0.0
+      // Too close to call: a mix on the beat could land on the offbeat. Better smooth.
+      if (margin < MIN_HALF_BEAT_MARGIN) confidence = minOf(confidence, 0.2f)
+      midBeatMs = midBeatMs?.let { aligned(it) + shift }
+      headGrid = headGrid?.let { LocalGrid(aligned(it.beatMs) + shift, it.spectrum, it.startMs) }
+      tailGrid = tailGrid?.let { LocalGrid(aligned(it.beatMs) + shift, it.spectrum, it.startMs) }
+      phaseNote =
+        "${if (shift > 0) "offbeat->shifted" else "on beat"} margin %.2f [%s]"
+          .format(margin, votes.joinToString(", "))
+    }
+    if (midSpectrum != null && midBeatMs != null) {
+      val periodFrames = midSpectrum.msToFrame(periodMs)
+      val phaseFrames = midSpectrum.msToFrame(positiveMod(midBeatMs - windows.middleStartMs, periodMs))
+      val bar = BeatDsp.downbeatPhase(midSpectrum, phaseFrames, periodFrames)
+      midDownbeatMs = windows.middleStartMs + midSpectrum.frameToMs(phaseFrames) + (bar?.first ?: 0) * periodMs
+      phaseNote += " bar ${bar?.first ?: "?"} conf %.2f".format(bar?.second ?: 0f)
+    }
+
     // Bar phase of a local grid: from the middle grid's bars when known, else its own.
     fun localDownbeat(grid: LocalGrid?): Double? {
       grid ?: return null
       val barMs = periodMs * 4
       val periodFrames = grid.spectrum.msToFrame(periodMs)
-      val phaseFrames = grid.spectrum.msToFrame(grid.beatMs - grid.startMs)
+      val phaseFrames = grid.spectrum.msToFrame(positiveMod(grid.beatMs - grid.startMs, periodMs))
       val bar = BeatDsp.downbeatPhase(grid.spectrum, phaseFrames, periodFrames)
       if (bar != null && (bar.second >= LOCAL_BAR_CONFIDENCE || midDownbeatMs == null)) {
-        return grid.beatMs + bar.first * periodMs
+        return grid.startMs + grid.spectrum.frameToMs(phaseFrames) + bar.first * periodMs
       }
       if (midDownbeatMs != null) {
         return (0 until 4)
@@ -423,6 +471,7 @@ object BeatAnalyzer {
       firstSoundMs = firstSound,
       lastSoundMs = lastSound,
       durationMs = windows.durationMs,
+      phaseNote = phaseNote,
     )
   }
 

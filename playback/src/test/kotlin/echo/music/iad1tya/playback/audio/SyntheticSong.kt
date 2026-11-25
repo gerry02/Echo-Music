@@ -24,6 +24,8 @@ class SyntheticSong(
   val shiftMs: Double = 0.0,
   /** Loud open hi-hat / clap on every offbeat, louder than the snare. */
   val offbeatAccent: Double = 0.0,
+  /** Loud offbeat hi-hats in the intro only, where no kick tells the beat apart. */
+  val introOffbeatAccent: Double = 0.0,
 ) {
   val beatMs = 60_000.0 / bpm
   val barMs = beatMs * 4
@@ -63,6 +65,11 @@ class SyntheticSong(
     val inEighth = ((sinceFirst % (beatMs / 2)) + beatMs / 2) % (beatMs / 2)
     if (sinceFirst >= 0) s += 0.08 * exp(-inEighth / 8.0) * (noise.nextDouble() * 2 - 1)
 
+    if (introOffbeatAccent > 0 && t < bodyStartMs && sinceFirst >= 0) {
+      val sinceOff = ((sinceFirst - beatMs / 2) % beatMs + beatMs) % beatMs
+      s += introOffbeatAccent * exp(-sinceOff / 40.0) * (noise.nextDouble() * 2 - 1) *
+        sin(2 * PI * 7_000.0 * t / 1000.0)
+    }
     if (offbeatAccent > 0 && body) {
       val sinceOff = ((sinceFirst - beatMs / 2) % beatMs + beatMs) % beatMs
       // Noise moved up around 7 kHz, like a hi-hat: no low end.

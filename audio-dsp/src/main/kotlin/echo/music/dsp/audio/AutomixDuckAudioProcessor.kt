@@ -58,6 +58,15 @@ class AutomixDuckAudioProcessor(
   private val hpIc2 = DoubleArray(2)
   private var hpCountdown = 0
 
+  /** Low-pass sweep, 0=open .. 1=cutoff at [MIN_LOW_PASS_HZ]: takes the highs out as a song leaves. */
+  @Volatile private var targetLowPass: Float = 0f
+  private var currentLowPass: Float = 0f
+  private var lpA1 = 1.0
+  private var lpA2 = 0.0
+  private var lpA3 = 0.0
+  private val lpIc1 = DoubleArray(2)
+  private val lpIc2 = DoubleArray(2)
+
   private var b0 = 1.0
   private var b1 = 0.0
   private var b2 = 0.0
@@ -80,6 +89,8 @@ class AutomixDuckAudioProcessor(
     private const val MIX_EASE_MS = 15.0
     private const val MIN_HIGH_PASS_HZ = 20.0
     private const val MAX_HIGH_PASS_HZ = 900.0
+    private const val MAX_LOW_PASS_HZ = 20_000.0
+    private const val MIN_LOW_PASS_HZ = 700.0
     private const val SVF_K = 1.4142135623730951 // 1/Q, Q = 0.707
     /** Samples between cutoff updates. */
     private const val HP_UPDATE_SAMPLES = 32
@@ -95,9 +106,34 @@ class AutomixDuckAudioProcessor(
     targetHighPass = fraction.coerceIn(0f, 1f)
   }
 
+  /** Sweep the low-pass toward [fraction]: 0=off, 1=dull (cutoff ~700 Hz). */
+  fun setLowPass(fraction: Float) {
+    targetLowPass = fraction.coerceIn(0f, 1f)
+  }
+
   fun resetGain() {
     targetMix = 0f
     targetHighPass = 0f
+    targetLowPass = 0f
+  }
+
+  private fun updateLowPassCoefficients() {
+    val hz = MAX_LOW_PASS_HZ * (MIN_LOW_PASS_HZ / MAX_LOW_PASS_HZ).pow(currentLowPass.toDouble())
+    val g = tan(PI * hz.coerceAtMost(sampleRate * 0.45) / sampleRate)
+    lpA1 = 1.0 / (1.0 + g * (g + SVF_K))
+    lpA2 = g * lpA1
+    lpA3 = g * lpA2
+  }
+
+  /** One low-pass step on channel [ch]; dry until the sweep starts, so it never clicks in. */
+  private fun lowPass(ch: Int, input: Double): Double {
+    val v3 = input - lpIc2[ch]
+    val v1 = lpA1 * lpIc1[ch] + lpA2 * v3
+    val v2 = lpIc2[ch] + lpA2 * lpIc1[ch] + lpA3 * v3
+    lpIc1[ch] = 2 * v1 - lpIc1[ch]
+    lpIc2[ch] = 2 * v2 - lpIc2[ch]
+    val wet = (currentLowPass * 20f).coerceAtMost(1f).toDouble()
+    return input + (v2 - input) * wet
   }
 
   private fun updateHighPassCoefficients() {
@@ -124,9 +160,11 @@ class AutomixDuckAudioProcessor(
 
   private fun stepHighPass(easePerSample: Float) {
     currentHighPass += (targetHighPass - currentHighPass) * easePerSample
+    currentLowPass += (targetLowPass - currentLowPass) * easePerSample
     if (--hpCountdown <= 0) {
       hpCountdown = HP_UPDATE_SAMPLES
       updateHighPassCoefficients()
+      updateLowPassCoefficients()
     }
   }
 
@@ -171,6 +209,7 @@ class AutomixDuckAudioProcessor(
 
     computeShelfCoefficients()
     updateHighPassCoefficients()
+    updateLowPassCoefficients()
     isActive = true
     return inputAudioFormat
   }
@@ -203,7 +242,7 @@ class AutomixDuckAudioProcessor(
           x1L = input
           y2L = y1L
           y1L = filtered
-          val output = highPass(0, input + (filtered - input) * currentMix)
+          val output = lowPass(0, highPass(0, input + (filtered - input) * currentMix))
           outputBuffer.putShort((output * 32768.0).coerceIn(-32768.0, 32767.0).toInt().toShort())
         }
       2 ->
@@ -225,8 +264,8 @@ class AutomixDuckAudioProcessor(
           y2R = y1R
           y1R = filteredR
 
-          val outL = highPass(0, inL + (filteredL - inL) * currentMix)
-          val outR = highPass(1, inR + (filteredR - inR) * currentMix)
+          val outL = lowPass(0, highPass(0, inL + (filteredL - inL) * currentMix))
+          val outR = lowPass(1, highPass(1, inR + (filteredR - inR) * currentMix))
 
           outputBuffer.putShort((outL * 32768.0).coerceIn(-32768.0, 32767.0).toInt().toShort())
           outputBuffer.putShort((outR * 32768.0).coerceIn(-32768.0, 32767.0).toInt().toShort())
@@ -265,6 +304,8 @@ class AutomixDuckAudioProcessor(
     y2R = 0.0
     hpIc1.fill(0.0)
     hpIc2.fill(0.0)
+    lpIc1.fill(0.0)
+    lpIc2.fill(0.0)
   }
 
   override fun reset() {
@@ -279,6 +320,8 @@ class AutomixDuckAudioProcessor(
     targetMix = 0f
     currentHighPass = 0f
     targetHighPass = 0f
+    currentLowPass = 0f
+    targetLowPass = 0f
   }
 
   override fun queueEndOfStream() {

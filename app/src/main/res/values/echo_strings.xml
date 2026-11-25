@@ -330,7 +330,7 @@
     <string name="automix_debug">Automix debug overlay</string>
     <string name="automix_debug_desc">Show live beat analysis and transition plan on the player</string>
     <string name="automix_pick_best_next">Pick the best next song</string>
-    <string name="automix_pick_best_next_desc">In radio queues, play next the one of the next 4 songs whose tempo and key mix best</string>
+    <string name="automix_pick_best_next_desc">With shuffle off, play next the one of the next 4 songs whose tempo and key mix best</string>
     <string name="automix_desc">DJ-style transitions: mix on the beat at musical points, matching tempos when they are close</string>
     <string name="automix_mix_in">MIX IN %1$d</string>
     <string name="crossfade_beta_title">Beta Feature</string>

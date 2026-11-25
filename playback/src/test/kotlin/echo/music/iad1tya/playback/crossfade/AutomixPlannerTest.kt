@@ -237,10 +237,12 @@ class AutomixPlannerTest {
   fun smoothWithBeatsThinsTheDrumsButBalladsStayClean() {
     val beats = AutomixPlanner.plan(track(), track(bpm = 90f), 60_000, 6_000)!!
     assertTrue(beats.filters)
-    assertTrue(AutomixPlanner.mixAt(beats, 0.9f).outHighPass > 0.3f)
+    assertTrue(AutomixPlanner.mixAt(beats, 0.9f).outLowPass > 0.3f)
+    // Highs leave with the outgoing song: no high-pass that would leave only its hi-hats.
+    assertEquals(0f, AutomixPlanner.mixAt(beats, 0.9f).outHighPass, 0f)
     val ballad = AutomixPlanner.plan(track(confidence = 0f), track(confidence = 0f), 60_000, 6_000)!!
     assertFalse(ballad.filters)
-    assertEquals(0f, AutomixPlanner.mixAt(ballad, 0.9f).outHighPass, 0f)
+    assertEquals(0f, AutomixPlanner.mixAt(ballad, 0.9f).outLowPass, 0f)
   }
 
   @Test

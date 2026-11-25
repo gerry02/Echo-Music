@@ -90,4 +90,17 @@ class AutomixDuckAudioProcessorTest {
     // A 200 Hz sine at half scale moves at most ~470 per sample; a click would be far more.
     assertTrue("max step $maxJump", maxJump < 800)
   }
+
+  @Test
+  fun lowPassSweepTakesTheHighsOutAndKeepsTheBass() {
+    val highs = processor().apply { setLowPass(1f) }
+    run(highs, stereoSine(8_000.0, 0.5))
+    val highOut = run(highs, stereoSine(8_000.0, 0.5, startSample = rate / 2))
+    assertTrue("8 kHz rms ${rms(highOut)}", rms(highOut) < 0.1 * 0.5 * 32767 / sqrt(2.0))
+
+    val bass = processor().apply { setLowPass(1f) }
+    run(bass, stereoSine(100.0, 0.5))
+    val bassOut = run(bass, stereoSine(100.0, 0.5, startSample = rate / 2))
+    assertEquals(0.5 * 32767 / sqrt(2.0), rms(bassOut), 0.05 * 32767)
+  }
 }

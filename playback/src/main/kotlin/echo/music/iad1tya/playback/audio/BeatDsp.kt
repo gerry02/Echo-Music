@@ -220,12 +220,12 @@ object BeatDsp {
   /**
    * The comb can lock onto the offbeats (loud hi-hats or claps on the "and"): the grid then has the
    * right tempo but sits half a beat off, and two songs mixed on it sound against each other. The
-   * beat is where the kick and the bass hit, so of the phase and the phase half a beat later this
-   * keeps the one with more low-band onset energy, broadband onsets breaking near ties.
+   * beat is where the kick and the bass hit. Returns how much of the grid at [phaseFrames] (first)
+   * and at half a beat later (second) looks like the beat: low-band onsets, broadband onsets at half
+   * weight, each as a share of both, so windows of any loudness add up.
    */
-  fun onBeatPhase(spectrum: Spectrum, phaseFrames: Double, periodFrames: Double): Double {
-    val shifted = phaseFrames + periodFrames / 2
-    fun score(phase: Double): Pair<Double, Double> {
+  fun halfBeatScores(spectrum: Spectrum, phaseFrames: Double, periodFrames: Double): Pair<Double, Double> {
+    fun sums(phase: Double): Pair<Double, Double> {
       var low = 0.0
       var all = 0.0
       var t = phase
@@ -236,14 +236,21 @@ object BeatDsp {
       }
       return low to all
     }
-    val (lowA, allA) = score(phaseFrames)
-    val (lowB, allB) = score(shifted)
+    val (lowA, allA) = sums(phaseFrames)
+    val (lowB, allB) = sums(phaseFrames + periodFrames / 2)
     val lowTotal = lowA + lowB
     val allTotal = allA + allB
-    if (lowTotal <= 0.0 || allTotal <= 0.0) return phaseFrames
-    val a = lowA / lowTotal + 0.5 * allA / allTotal
-    val b = lowB / lowTotal + 0.5 * allB / allTotal
-    return if (b > a * 1.1) shifted % periodFrames else phaseFrames
+    var a = 0.0
+    var b = 0.0
+    if (lowTotal > 0) {
+      a += lowA / lowTotal
+      b += lowB / lowTotal
+    }
+    if (allTotal > 0) {
+      a += 0.5 * allA / allTotal
+      b += 0.5 * allB / allTotal
+    }
+    return a to b
   }
 
   /** The first beat of a bar among a grid of beats: (index 0..3 of the first downbeat, confidence). */

@@ -103,4 +103,21 @@ class BeatAnalyzerTest {
     assertOnBar("head anchor", r.headAnchorMs, song)
     assertOnBar("tail anchor", r.tailAnchorMs, song)
   }
+
+  @Test
+  fun anIntroOfOffbeatHatsStaysOnTheSongsBeat() {
+    // 7 bars of hats on the "and" with nothing on the beat: alone, the start of the song locks
+    // half a beat off its body, and a mix starting there lands against the outgoing song.
+    val song =
+      SyntheticSong(
+        bpm = 126.0,
+        firstDownbeatMs = 120.0,
+        durationMs = 220_000,
+        introBars = 7,
+        introOffbeatAccent = 0.5,
+      )
+    val r = BeatAnalyzer.analyzePcm(song.windows())!!
+    assertTrue(r.phaseNote, r.phaseNote.startsWith("on beat"))
+    assertOnBar("head anchor", r.headAnchorMs, song)
+  }
 }

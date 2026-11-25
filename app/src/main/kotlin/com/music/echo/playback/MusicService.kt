@@ -355,6 +355,11 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
     val transition: AutomixPlanner.Plan,
     /** Speed and pitch the user plays at; the blend's time stretch applies on top. */
     val baseParameters: PlaybackParameters,
+    /**
+     * The incoming grid comes from the YouTube analysis because the next song was not known to
+     * play lossless when planned: checked again once its stream is resolved.
+     */
+    val incomingAssumedYouTube: Boolean = false,
   ) {
     val triggerTimeMs: Long
       get() = transition.triggerMs
@@ -384,6 +389,14 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
   /** Stream measurements of lossless files, by "mediaId:head" / "mediaId:tail". */
   private val streamProbes =
     java.util.concurrent.ConcurrentHashMap<String, Pair<Long, BeatAnalyzer.Result?>>()
+
+  /**
+   * Automix decisions, in logcat under "Automix" also in release builds (Timber logs only in debug
+   * builds): what each song's analysis found and why each transition went the way it did.
+   */
+  private fun automixLog(message: String) {
+    android.util.Log.i("Automix", message)
+  }
 
   /** Songs analyzed from a file cut short in this session: not fetched again until restart. */
   private val partiallyAnalyzed = java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap<String, Boolean>())
@@ -5666,7 +5679,8 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
     return pair.currentId == plan.currentId && pair.nextId == plan.nextId
   }
 
-  private fun scheduleCrossfade() {
+  /** @param incomingResolved the next song's stream was already checked (see the trigger loop). */
+  private fun scheduleCrossfade(incomingResolved: Boolean = false) {
     crossfadeTriggerJob?.cancel()
     crossfadeTriggerJob = null
     releasePrebuffered()
@@ -5709,6 +5723,7 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
       // Poll playback position instead of a wall-clock delay: position freezes on
       // pause, so the trigger can't misfire while paused and get lost.
       var prebufferStarted = false
+      var incomingSourceChecked = incomingResolved
       val replanAt = planResult.replanAtMs
       while (isActive) {
         if (player.currentMediaItem?.mediaId != targetMediaId) return@launch
@@ -5727,6 +5742,21 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
         if (!prebufferStarted && remaining <= leadTime) {
           prebufferStarted = true
           prebufferSecondaryPlayer(plan)
+        }
+        // The next song's stream is known once its player is ready: a lossless file plays a
+        // different encode than the YouTube one its grid came from. Plan again, measuring it.
+        if (
+          plan != null &&
+            plan.incomingAssumedYouTube &&
+            !incomingSourceChecked &&
+            prebuffered?.player?.playbackState == Player.STATE_READY
+        ) {
+          incomingSourceChecked = true
+          if (streamIsLossless(plan.nextId)) {
+            automixLog("next ${plan.nextId} turned out lossless: planning again on its own stream")
+            scheduleCrossfade(incomingResolved = true)
+            return@launch
+          }
         }
         // Fine polling near the trigger: a blend on the beat must start within a few ms.
         delay(minOf(remaining, if (remaining < 400) 5L else 100L))
@@ -5774,6 +5804,7 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
       )
     if (outBeat == null) {
       automixDebugInfo.value = partialDebug.copy(status = "fallback: analysis pending (current)")
+      automixLog("plan $currentId -> $nextId: plain crossfade, current song not analyzed yet")
       return AutomixPlanResult(plan = null, pairAnalyzed = false)
     }
 
@@ -5804,19 +5835,42 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
       )
     if (transition == null) {
       automixDebugInfo.value = partialDebug.copy(status = "fallback: trigger out of range")
+      automixLog("plan $currentId -> $nextId: plain crossfade, too late to plan (pos ${player.currentPosition})")
       return AutomixPlanResult(plan = null, pairAnalyzed = inBeat != null)
     }
-    val plan = AutomixPlan(currentId, nextId, transition, userPlaybackParameters())
-    Timber.tag(TAG)
-      .d(
-        "Automix plan (%s): trigger=%dms incomingStart=%dms speed=%.3f overlap=%dms swap=%.2f",
-        transition.reason,
-        plan.triggerTimeMs,
-        plan.incomingStartMs,
-        transition.incomingSpeed,
-        plan.overlapMs,
-        transition.bassSwapAt,
-      )
+    val incomingAssumedYouTube =
+      inBeat != null && !nextId.isLocalMediaId() && !streamIsLossless(nextId)
+    val plan =
+      AutomixPlan(currentId, nextId, transition, userPlaybackParameters(), incomingAssumedYouTube)
+    fun describe(t: AutomixPlanner.Track?): String =
+      t?.let {
+        "%.2f bpm conf %.2f tailBar %s headBar %s mixIn %s mixOut %s end %s dur %d %s".format(
+          it.bpm,
+          it.confidence,
+          it.tailAnchorMs,
+          it.headAnchorMs,
+          it.mixInMs,
+          it.mixOutMs,
+          it.lastSoundMs,
+          it.durationMs,
+          if (it.gridTrusted) "grid ok" else "grid NOT measured on this stream",
+        )
+      } ?: "not analyzed"
+    automixLog(
+      "plan $currentId -> $nextId: ${transition.reason} | mix at %d ms (pos %d) for %d ms, next from %d ms, speed x%.4f, bass swap at %.2f, filters %s | out: %s | in: %s%s"
+        .format(
+          plan.triggerTimeMs,
+          player.currentPosition,
+          plan.overlapMs,
+          plan.incomingStartMs,
+          transition.incomingSpeed,
+          transition.bassSwapAt,
+          transition.filters,
+          describe(outTrack),
+          describe(inTrack),
+          if (incomingAssumedYouTube) " | next assumed YouTube" else "",
+        )
+    )
     automixDebugInfo.value =
       partialDebug.copy(
         status = "plan ready: ${transition.reason}",
@@ -5828,23 +5882,21 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
   }
 
   /**
-   * "Pick the best next song": in a radio queue (not shuffled), moves the one of the next
+   * "Pick the best next song": in any queue played in order (not shuffled), moves the one of the next
    * [BEST_NEXT_CANDIDATES] songs that mixes best with this one (same tempo, compatible key) up to
    * play next, when clearly better than the current next. Once per song; waits for the candidates'
    * analysis until a minute and a half before the end. Returns true when it moved a song.
    */
   private suspend fun pickBestNextSong(): Boolean {
-    if (!automixPickBestNext || player.shuffleModeEnabled) return false
-    if (player.repeatMode == REPEAT_MODE_ONE) return false
-    val queue = currentQueue
-    val radio =
-      queue is echo.music.iad1tya.playback.queues.YouTubeQueue ||
-        queue is echo.music.iad1tya.playback.queues.YouTubeAlbumRadio ||
-        queue is echo.music.iad1tya.playback.queues.LocalAlbumRadio ||
-        queue is echo.music.iad1tya.playback.queues.LocalMixQueue
-    if (!radio) return false
+    if (!automixPickBestNext) return false
     val currentId = player.currentMediaItem?.mediaId ?: return false
     if (bestNextPickedFor == currentId) return false
+    if (player.shuffleModeEnabled || player.repeatMode == REPEAT_MODE_ONE) {
+      bestNextPickedFor = currentId
+      automixLog("best next for $currentId: skipped, ${if (player.shuffleModeEnabled) "shuffle on" else "repeat one"}")
+      return false
+    }
+    if (isCurrentEpisode || isNextItemEpisode()) return false
     val current = player.currentMediaItemIndex
     val last = minOf(current + BEST_NEXT_CANDIDATES, player.mediaItemCount - 1)
     if (last - current < 2) return false
@@ -5858,14 +5910,22 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
       if (player.currentPosition < decideBy) return false // analysis still coming
     }
     bestNextPickedFor = currentId
-    outBeat ?: return false
+    if (outBeat == null) {
+      automixLog("best next for $currentId: skipped, current song not analyzed")
+      return false
+    }
     val outTrack = trackFromEntity(outBeat, player.duration)
-    val best =
-      AutomixPlanner.pickBestNext(
-        outTrack,
-        candidates.map { it?.let { e -> trackFromEntity(e, 0L) } },
-      ) ?: return false
-    Timber.tag(TAG).d("Automix: %s mixes better, moved up to play next", ids[best])
+    val tracks = candidates.map { it?.let { e -> trackFromEntity(e, 0L) } }
+    val scores =
+      ids.indices.joinToString(", ") { i ->
+        "${ids[i]} " + (tracks[i]?.let { "%.0f bpm %.1f".format(it.bpm, AutomixPlanner.mixScore(outTrack, it)) } ?: "not analyzed")
+      }
+    val best = AutomixPlanner.pickBestNext(outTrack, tracks)
+    if (best == null) {
+      automixLog("best next for $currentId (%.0f bpm): order kept [%s]".format(outTrack.bpm, scores))
+      return false
+    }
+    automixLog("best next for $currentId (%.0f bpm): ${ids[best]} moved up to play next [%s]".format(outTrack.bpm, scores))
     player.moveMediaItem(current + 1 + best, current + 1)
     return true
   }
@@ -5924,8 +5984,7 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
     val probe = probeLosslessStream(mediaId, entity.bpm, tail)
     val anchor = if (tail) probe?.tailAnchorMs else probe?.headAnchorMs
     if (probe != null && anchor != null) {
-      Timber.tag(TAG)
-        .d("Automix: lossless %s measured, %s bar at %d ms", mediaId, if (tail) "end" else "start", anchor)
+      automixLog("lossless $mediaId: ${if (tail) "end" else "start"} measured from cache, bar at $anchor ms; ${probe.phaseNote}")
       return if (tail) {
         base.copy(
           tailAnchorMs = anchor,
@@ -5943,6 +6002,7 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
         )
       }
     }
+    automixLog("lossless $mediaId: ${if (tail) "end" else "start"} not measurable from cache yet, beat sync off")
     val analyzed = entity.analyzedDurationMs
     val sameEdit = analyzed != null && durationMs > 0 && kotlin.math.abs(analyzed - durationMs) <= 1_500
     return if (sameEdit) {
@@ -6106,15 +6166,29 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
       result = fetched.result
       dataComplete = fetched.complete
     }
-    Timber.tag(TAG)
-      .d(
-        "Beat analysis done for %s: %s",
-        mediaId,
-        result?.let {
-          "bpm=%.1f conf=%.2f mixIn=%s mixOut=%s"
-            .format(it.bpm, it.confidence, it.mixInPointMs, it.mixOutPointMs)
-        } ?: "failed (complete=$dataComplete)",
-      )
+    automixLog(
+      "analysis $mediaId: " +
+        (result?.let {
+          "%.2f bpm conf %.2f beat %d bar %s headBar %s tailBar %s mixIn %s mixOut %s sound %s..%s dur %d key %s%s complete %s; %s"
+            .format(
+              it.bpm,
+              it.confidence,
+              it.firstBeatOffsetMs,
+              it.downbeatOffsetMs,
+              it.headAnchorMs,
+              it.tailAnchorMs,
+              it.mixInPointMs,
+              it.mixOutPointMs,
+              it.firstSoundMs,
+              it.lastSoundMs,
+              it.durationMs,
+              it.keyPitchClass,
+              if (it.keyIsMinor == true) "m" else "",
+              dataComplete,
+              it.phaseNote,
+            )
+        } ?: "failed (complete=$dataComplete)")
+    )
     if (!dataComplete) partiallyAnalyzed.add(mediaId)
     if (result == null && !dataComplete) return // partial data; retry when fully cached
 
@@ -6266,6 +6340,9 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
 
   private fun startCrossfade(plan: AutomixPlan? = null) {
     if (isCrossfading.value) return
+    automixLog(
+      "start: ${plan?.transition?.reason ?: "plain crossfade"} at pos ${player.currentPosition} (planned ${plan?.triggerTimeMs}, started ${if (plan?.isBeatMatch == true) learnedStartLatencyMs else 0} ms early)"
+    )
     if (
       isBitPerfectEnabled &&
         usbDacManager.activeDacFlow.value is echo.music.usbaudio.DacDeviceState.Connected
@@ -6512,6 +6589,7 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
             if (djPlan.transition.filters) {
               outDuck?.setMix(mix.outBassCut)
               outDuck?.setHighPass(mix.outHighPass)
+              outDuck?.setLowPass(mix.outLowPass)
               inDuck?.setMix(mix.inBassCut)
               inDuck?.setHighPass(mix.inHighPass)
             }
@@ -6591,6 +6669,7 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
       val speed = plan.transition.incomingSpeed
       val expected = plan.incomingStartMs + (outPos - plan.triggerTimeMs) * speed
       val errorMs = (player.currentPosition - expected).toLong()
+      automixLog("phase: next song $errorMs ms ${if (errorMs >= 0) "ahead" else "behind"} (start latency guess $learnedStartLatencyMs ms)")
       if (lastErrorMs == null && kotlin.math.abs(errorMs) <= PHASE_GIVE_UP_MS) {
         // Behind = it took longer to start than assumed: start earlier next time.
         learnedStartLatencyMs = (learnedStartLatencyMs - errorMs / 2).coerceIn(0L, 250L)
@@ -6599,7 +6678,10 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
       automixDebugInfo.value = automixDebugInfo.value?.copy(phaseErrorMs = errorMs)
       when {
         // Off by more than a beat: a stall, not drift. Ride it out on the fades.
-        kotlin.math.abs(errorMs) > PHASE_GIVE_UP_MS -> gaveUp = true
+        kotlin.math.abs(errorMs) > PHASE_GIVE_UP_MS -> {
+          gaveUp = true
+          automixLog("phase: off by more than $PHASE_GIVE_UP_MS ms, a stall: lock off")
+        }
         kotlin.math.abs(errorMs) <= PHASE_DEADBAND_MS -> Unit
         nudges >= MAX_PHASE_NUDGES -> Unit
         else -> {
@@ -6609,8 +6691,7 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
           setSpeed(speed * (1 + correction))
           nudgeEndsAtMs = now + nudgeMs.coerceIn(200L, PHASE_NUDGE_MS.toLong() * 2)
           nudges++
-          Timber.tag(TAG)
-            .d("Automix phase: %d ms off, speed x%.3f for %d ms", errorMs, 1 + correction, nudgeMs)
+          automixLog("phase: nudge speed x%.3f for %d ms".format(1 + correction, nudgeMs))
         }
       }
     }
