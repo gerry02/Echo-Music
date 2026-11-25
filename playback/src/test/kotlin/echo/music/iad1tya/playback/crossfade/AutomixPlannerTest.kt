@@ -230,7 +230,58 @@ class AutomixPlannerTest {
     assertEquals(16f / 32f, long.bassSwapAt, 0.0001f)
     // The incoming song is held thin until the swap, then opens.
     assertTrue(AutomixPlanner.mixAt(long, 0.2f).inHighPass > 0.5f)
-    assertEquals(0f, AutomixPlanner.mixAt(long, 0.6f).inHighPass, 0.001f)
+    assertEquals(0f, AutomixPlanner.mixAt(long, 0.7f).inHighPass, 0.001f)
+    // It opens gradually, not in one step at the swap.
+    val before = AutomixPlanner.mixAt(long, 0.45f).inHighPass
+    assertTrue("$before", before > 0.05f && before < 0.55f)
+    // The basslines cross over a bar: halfway through it both are half cut.
+    val mid = AutomixPlanner.mixAt(long, 0.5f + 2f / 32f)
+    assertEquals(0.5f, mid.outBassCut, 0.05f)
+    assertEquals(0.5f, mid.inBassCut, 0.05f)
+  }
+
+  @Test
+  fun phaseErrorWrapsToTheNearestBeat() {
+    val period = 60_000.0 / 140 // 428.6 ms
+    // The phone log: 391 ms behind is 37.6 ms ahead of the previous beat.
+    assertEquals(37.6, AutomixPlanner.wrapPhaseError(-391.0, period), 0.1)
+    assertEquals(-20.0, AutomixPlanner.wrapPhaseError(-20.0, period), 1e-9)
+    assertEquals(15.0, AutomixPlanner.wrapPhaseError(15.0 + 2 * period, period), 1e-6)
+    assertEquals(-100.0, AutomixPlanner.wrapPhaseError(period - 100.0, period), 1e-6)
+    // Never more than half a beat either way.
+    for (e in -2000..2000 step 7) {
+      val w = AutomixPlanner.wrapPhaseError(e.toDouble(), period)
+      assertTrue("$e -> $w", w > -period / 2 - 1e-9 && w <= period / 2 + 1e-9)
+    }
+  }
+
+  @Test
+  fun aBlendStillOffTheBeatWhenHeardFinishesFast() {
+    // Small offsets are fine; a big one is tolerated only while the next song is not heard yet.
+    assertFalse(AutomixPlanner.shouldBail(20.0, 0.5f))
+    assertFalse(AutomixPlanner.shouldBail(-150.0, 0.05f))
+    assertTrue(AutomixPlanner.shouldBail(-150.0, AutomixPlanner.PHASE_AUDIBLE_AT))
+    assertTrue(AutomixPlanner.shouldBail(31.0, 0.3f))
+    // The rest of the blend then takes at most BAIL_BLEND_MS.
+    assertEquals(0.3f, AutomixPlanner.bailProgress(0.3f, 0), 1e-6f)
+    assertEquals(0.55f, AutomixPlanner.bailProgress(0.3f, AutomixPlanner.BAIL_BLEND_MS / 4), 1e-4f)
+    assertEquals(1f, AutomixPlanner.bailProgress(0.3f, AutomixPlanner.BAIL_BLEND_MS), 0f)
+  }
+
+  @Test
+  fun aSongIsNeverStartedHalfwayThrough() {
+    // A 6-minute next song whose analysis put the end of its intro 3 minutes in.
+    val next = track(durationMs = 360_000, mixIn = 180_250, firstSound = 0)
+    val plan = AutomixPlanner.plan(track(), next, positionMs = 60_000, fadeMs = 5_000)!!
+    assertTrue("starts at ${plan.incomingStartMs}", plan.incomingStartMs <= AutomixPlanner.MAX_MIX_IN_MS)
+    // Same for a first sound far in.
+    val late = track(durationMs = 360_000, mixIn = null, firstSound = 200_000)
+    val p2 = AutomixPlanner.plan(track(), late, positionMs = 60_000, fadeMs = 5_000)!!
+    assertTrue("starts at ${p2.incomingStartMs}", p2.incomingStartMs <= AutomixPlanner.MAX_MIX_IN_MS)
+    // And the 6-minute song itself is not left at 3 minutes.
+    val six = track(durationMs = 360_000, mixOut = 180_250, lastSound = 358_000)
+    val p3 = AutomixPlanner.plan(six, track(), positionMs = 60_000, fadeMs = 5_000)!!
+    assertTrue("leaves at ${p3.triggerMs}", p3.triggerMs >= 300_000)
   }
 
   @Test

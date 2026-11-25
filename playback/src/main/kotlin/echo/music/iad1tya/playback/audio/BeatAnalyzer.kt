@@ -64,6 +64,8 @@ object BeatAnalyzer {
     val headStartMs: Long = 0L,
     val tail: MonoPcm? = null,
     val tailStartMs: Long = 0L,
+    /** What went wrong reading the windows, for the log. */
+    val note: String = "",
   )
 
   private const val TAG = "BeatAnalyzer"
@@ -187,6 +189,7 @@ object BeatAnalyzer {
     knownBpm: Float,
     head: Boolean,
     tail: Boolean,
+    durationHintMs: Long = 0L,
     shouldCancel: () -> Boolean = { false },
   ): Result? =
     analyzeSource(
@@ -194,6 +197,7 @@ object BeatAnalyzer {
       wantMiddle = false,
       wantHead = head,
       wantTail = tail,
+      durationHintMs = durationHintMs,
       shouldCancel = shouldCancel,
     ) { extractor ->
       extractor.setDataSource(source)
@@ -204,6 +208,8 @@ object BeatAnalyzer {
     wantMiddle: Boolean = true,
     wantHead: Boolean = true,
     wantTail: Boolean = true,
+    /** The real length when known (the player's): a stream header can misstate it. */
+    durationHintMs: Long = 0L,
     shouldCancel: () -> Boolean = { false },
     setSource: (MediaExtractor) -> Unit,
   ): Result? {
@@ -224,14 +230,33 @@ object BeatAnalyzer {
       }
       if (trackIndex < 0 || format == null) return null
       extractor.selectTrack(trackIndex)
-      val durationUs =
+      val headerUs =
         if (format.containsKey(MediaFormat.KEY_DURATION)) format.getLong(MediaFormat.KEY_DURATION)
         else 0L
+      val notes = ArrayList<String>()
+      val durationUs =
+        if (durationHintMs > 0 && abs(headerUs / 1000 - durationHintMs) > 3_000) {
+          notes += "header says ${headerUs / 1000} ms, using $durationHintMs ms"
+          durationHintMs * 1000
+        } else {
+          headerUs
+        }
 
       fun window(startUs: Long, lengthUs: Long): Pair<MonoPcm, Long>? {
         if (shouldCancel()) return null
         return try {
           extractor.seekTo(startUs, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
+          // A file without a seek index (a WebM fetched in part, a FLAC without a seek table) lands
+          // back at its start: walk the compressed samples, without decoding, to the window.
+          if (extractor.sampleTime in 0 until startUs - 3_000_000) {
+            while (extractor.sampleTime in 0 until startUs - 500_000) {
+              if (!extractor.advance() || shouldCancel()) break
+            }
+          }
+          if (extractor.sampleTime < 0) {
+            notes += "no data at ${startUs / 1000} ms"
+            return null
+          }
           val actualStartMs = max(0L, extractor.sampleTime) / 1000
           decodeMono(extractor, format, lengthUs, shouldCancel)?.let { it to actualStartMs }
         } catch (e: Exception) {
@@ -250,8 +275,11 @@ object BeatAnalyzer {
         if (wantTail && durationUs > TAIL_WINDOW_US) {
           window(durationUs - TAIL_WINDOW_US, TAIL_WINDOW_US)?.takeIf { (pcm, startMs) ->
             val reaches = startMs + pcm.durationMs >= durationUs / 1000 - TAIL_END_SLACK_MS
-            if (!reaches) Timber.tag(TAG).d("Tail window stops at %d ms of %d: ignored", startMs + pcm.durationMs, durationUs / 1000)
+            if (!reaches) notes += "tail ${startMs}..${startMs + pcm.durationMs} ms stops before the end ${durationUs / 1000}: ignored"
             reaches
+          } ?: run {
+            if (notes.none { it.startsWith("tail") }) notes += "tail not readable"
+            null
           }
         } else null
       if (shouldCancel()) return null
@@ -265,6 +293,7 @@ object BeatAnalyzer {
           headStartMs = head?.second ?: 0L,
           tail = tail?.first,
           tailStartMs = tail?.second ?: 0L,
+          note = notes.joinToString("; "),
         ),
         knownBpm,
       )
@@ -471,7 +500,7 @@ object BeatAnalyzer {
       firstSoundMs = firstSound,
       lastSoundMs = lastSound,
       durationMs = windows.durationMs,
-      phaseNote = phaseNote,
+      phaseNote = listOf(phaseNote, windows.note).filter { it.isNotBlank() }.joinToString("; "),
     )
   }
 
