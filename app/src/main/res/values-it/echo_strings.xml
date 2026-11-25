@@ -649,4 +649,6 @@
     <string name="home_featured_carousel_desc">Mostra nella Home il carosello grande a scorrimento automatico</string>
     <string name="home_community_desc">Mostra nella Home le playlist della community</string>
     <string name="home_mood_and_genres_desc">Mostra nella Home le scorciatoie per mood e generi</string>
+    <string name="automix_pick_best_next">Scegli il brano successivo migliore</string>
+    <string name="automix_pick_best_next_desc">Nelle code radio, fa suonare prima quello tra i prossimi 4 brani con tempo e tonalità più adatti al mix</string>
 </resources>

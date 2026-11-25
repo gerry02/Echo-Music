@@ -42,6 +42,7 @@ import echo.music.iad1tya.constants.AutoLoadMoreKey
 import echo.music.iad1tya.constants.AutoSkipNextOnErrorKey
 import echo.music.iad1tya.constants.AutomixCrossfadeKey
 import echo.music.iad1tya.constants.AutomixDebugOverlayKey
+import echo.music.iad1tya.constants.AutomixPickBestNextKey
 import echo.music.iad1tya.constants.AutoplayOnAutomotiveConnectKey
 import echo.music.iad1tya.constants.CrossfadeDurationKey
 import echo.music.iad1tya.constants.CrossfadeEnabledKey
@@ -111,6 +112,8 @@ fun PlayerSettings(
     rememberPreference(AutomixCrossfadeKey, defaultValue = false)
   val (automixDebugOverlay, onAutomixDebugOverlayChange) =
     rememberPreference(AutomixDebugOverlayKey, defaultValue = false)
+  val (automixPickBestNext, onAutomixPickBestNextChange) =
+    rememberPreference(AutomixPickBestNextKey, defaultValue = false)
   val (crossfadeGapless, onCrossfadeGaplessChange) =
     rememberPreference(CrossfadeGaplessKey, defaultValue = true)
   val (persistentQueue, onPersistentQueueChange) =
@@ -692,6 +695,31 @@ fun PlayerSettings(
             ),
           )
           if (automixCrossfade) {
+            add(
+              Material3SettingsItem(
+                isHighlighted = highlightKey == stringResource(R.string.automix_pick_best_next),
+                icon = painterResource(R.drawable.queue_music),
+                title = { Text(stringResource(R.string.automix_pick_best_next)) },
+                description = { Text(stringResource(R.string.automix_pick_best_next_desc)) },
+                trailingContent = {
+                  Switch(
+                    checked = automixPickBestNext,
+                    onCheckedChange = onAutomixPickBestNextChange,
+                    thumbContent = {
+                      Icon(
+                        painter =
+                          painterResource(
+                            id = if (automixPickBestNext) R.drawable.check else R.drawable.close,
+                          ),
+                        contentDescription = null,
+                        modifier = Modifier.size(SwitchDefaults.IconSize),
+                      )
+                    },
+                  )
+                },
+                onClick = { onAutomixPickBestNextChange(!automixPickBestNext) },
+              ),
+            )
             add(
               Material3SettingsItem(
                 isHighlighted = highlightKey == stringResource(R.string.automix_debug),

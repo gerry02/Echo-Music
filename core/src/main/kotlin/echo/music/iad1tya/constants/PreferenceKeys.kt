@@ -199,6 +199,7 @@ val CrossfadeDurationKey = floatPreferencesKey("crossfadeDuration")
 val CrossfadeGaplessKey = booleanPreferencesKey("crossfadeGapless")
 val AutomixCrossfadeKey = booleanPreferencesKey("automixCrossfade")
 val AutomixDebugOverlayKey = booleanPreferencesKey("automixDebugOverlay")
+val AutomixPickBestNextKey = booleanPreferencesKey("automixPickBestNext")
 
 val MaxImageCacheSizeKey = intPreferencesKey("maxImageCacheSize")
 val MaxSongCacheSizeKey = intPreferencesKey("maxSongCacheSize")

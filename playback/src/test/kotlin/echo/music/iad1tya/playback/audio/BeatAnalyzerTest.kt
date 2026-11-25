@@ -92,4 +92,15 @@ class BeatAnalyzerTest {
     assertOnBar("probed head anchor", r.headAnchorMs, song)
     assertEquals(song.bodyStartMs + 180.0, r.mixInPointMs!!.toDouble(), 20.0)
   }
+
+  @Test
+  fun loudOffbeatsDoNotPullTheGridHalfABeatOff() {
+    val song =
+      SyntheticSong(bpm = 124.0, firstDownbeatMs = 310.0, durationMs = 210_000, offbeatAccent = 0.7)
+    val r = BeatAnalyzer.analyzePcm(song.windows())!!
+    assertEquals(124f, r.bpm, 0.3f)
+    assertTrue("$r", gridError(r.firstBeatOffsetMs, song.firstDownbeatMs, song.beatMs) <= 15.0)
+    assertOnBar("head anchor", r.headAnchorMs, song)
+    assertOnBar("tail anchor", r.tailAnchorMs, song)
+  }
 }

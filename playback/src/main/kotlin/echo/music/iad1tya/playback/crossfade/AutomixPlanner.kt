@@ -23,8 +23,12 @@ object AutomixPlanner {
   /** Largest time stretch of the incoming song; beyond it the change of tempo is audible. */
   const val MAX_TEMPO_CHANGE = 0.06f
   const val MIN_CONFIDENCE = 0.3f
-  private const val MAX_BLEND_MS = 20_000.0
+  private const val MAX_BLEND_MS = 24_000.0
   private const val MIN_BLEND_BEATS = 8
+  /** A blend never starts earlier than this before the end, nor in the first 3/4 of a short song. */
+  const val MAX_MIX_LEAD_MS = 60_000L
+  /** Trailing silence longer than this is taken for an analysis error, not silence. */
+  private const val MAX_TRAILING_SILENCE_MS = 20_000L
   /** Room kept before the outgoing stream's real end. */
   private const val END_MARGIN_MS = 300L
   private const val MIN_SMOOTH_MS = 1_500L
@@ -60,6 +64,21 @@ object AutomixPlanner {
 
     val tailBars: Double
       get() = (tailAnchorMs ?: downbeatOffsetMs ?: firstBeatOffsetMs).toDouble()
+
+    /** Where the audio really ends; a "last sound" far from the end is not believed. */
+    val audibleEndMs: Double
+      get() =
+        (lastSoundMs?.takeIf { it >= durationMs - MAX_TRAILING_SILENCE_MS } ?: durationMs)
+          .coerceAtMost(durationMs)
+          .toDouble()
+
+    /** The earliest a blend out of this song may start: inside its last minute (or quarter). */
+    val earliestMixOutMs: Double
+      get() = (durationMs - minOf(MAX_MIX_LEAD_MS.toDouble(), durationMs * 0.25)).coerceAtLeast(0.0)
+
+    /** The outro start, when it lies where an outro can be. */
+    val trustedMixOutMs: Long?
+      get() = mixOutMs?.takeIf { it >= earliestMixOutMs && it < durationMs }
   }
 
   enum class Style {
@@ -83,6 +102,8 @@ object AutomixPlanner {
     val bassSwapAt: Float = 0.5f,
     /** One beat as a fraction of the blend: how fast the bass swap goes. */
     val beatFraction: Float = 0.05f,
+    /** Whether the blend filters the songs (high-pass sweeps, bass swap). */
+    val filters: Boolean = false,
     val reason: String = "",
   )
 
@@ -123,39 +144,59 @@ object AutomixPlanner {
     return minOf(d, 12 - d) <= 1
   }
 
+  /**
+   * How well [candidate] mixes after [out]: 0 = only a smooth crossfade, up to 2 for the same tempo
+   * (a beat match), +1 for a compatible key. Null candidates (not analyzed) score nothing.
+   */
+  fun mixScore(out: Track, candidate: Track?): Float {
+    if (candidate == null) return 0f
+    var score = 0f
+    if (out.hasBeat && candidate.hasBeat) {
+      val off = abs(foldRatio(out.bpm / candidate.bpm) - 1f)
+      if (off <= MAX_TEMPO_CHANGE) score += 2f - off / MAX_TEMPO_CHANGE
+    }
+    if (keysCompatible(out, candidate) == true) score += 1f
+    return score
+  }
+
+  /**
+   * Among the next few songs ([candidates], the first being the one that would play next), the one
+   * to move up so it plays next: only when it mixes clearly better than that one. Null keeps the
+   * order.
+   */
+  fun pickBestNext(out: Track, candidates: List<Track?>): Int? {
+    if (candidates.size < 2) return null
+    val scores = candidates.map { mixScore(out, it) }
+    val best = scores.indices.maxByOrNull { scores[it] } ?: return null
+    // A key alone never reorders a next song that already beat-matches.
+    return if (best != 0 && scores[best] >= scores[0] + 1.5f) best else null
+  }
+
   private fun beatMatch(out: Track, incoming: Track, speed: Float, earliest: Long): Plan? {
     val outPeriod = out.periodMs
     val outBar = outPeriod * 4
     val inPeriod = incoming.periodMs
     val inBar = inPeriod * 4
-    val audibleEnd = (out.lastSoundMs ?: out.durationMs).coerceAtMost(out.durationMs).toDouble()
+    val audibleEnd = out.audibleEndMs
     val hardEnd = (out.durationMs - END_MARGIN_MS).toDouble()
 
-    val inFirstBar =
-      snapUp((incoming.firstSoundMs ?: 0L).toDouble(), incoming.headBars, inBar).let {
-        if (it < 0) it + inBar else it
-      }
-    val outroBeats = out.mixOutMs?.let { ((audibleEnd - it) / outPeriod).toInt() } ?: 0
-    val introBeats = incoming.mixInMs?.let { ((it - inFirstBar) / inPeriod).toInt() } ?: 0
+    val inFirstBar = snapUp((incoming.firstSoundMs ?: 0L).toDouble(), incoming.headBars, inBar)
 
-    var beats = 16
-    for (candidate in intArrayOf(32, 16)) {
-      if (candidate <= maxOf(outroBeats, introBeats, 16) && candidate * outPeriod <= MAX_BLEND_MS) {
-        beats = candidate
-        break
-      }
-    }
+    // 8 bars when the tempo allows, 4 when the keys clash (two harmonies at once).
+    var beats = if (32 * outPeriod <= MAX_BLEND_MS) 32 else 16
     if (keysCompatible(out, incoming) == false) beats = minOf(beats, 16)
     while (beats > MIN_BLEND_BEATS && beats * outPeriod > MAX_BLEND_MS) beats -= 4
 
-    // Start on the outro if there is one, else as late as a whole blend still fits.
+    // Start on the outro if there is one, else as late as a whole blend still fits; never
+    // before the song's last minute.
     var trigger =
-      out.mixOutMs
+      out.trustedMixOutMs
         ?.toDouble()
         ?.takeIf { it + beats * outPeriod <= hardEnd }
         ?.let { snapNearest(it, out.tailBars, outBar) }
         ?: snapDown(minOf(audibleEnd, hardEnd) - beats * outPeriod, out.tailBars, outBar)
-    if (trigger < earliest) trigger = snapUp(earliest.toDouble(), out.tailBars, outBar)
+    val floor = maxOf(earliest.toDouble(), out.earliestMixOutMs)
+    if (trigger < floor) trigger = snapUp(floor, out.tailBars, outBar)
     // Late (a seek near the end): shrink the blend by whole bars to what is left.
     while (beats > MIN_BLEND_BEATS && trigger + beats * outPeriod > hardEnd) beats -= 4
     if (trigger + beats * outPeriod > hardEnd) return null
@@ -165,7 +206,10 @@ object AutomixPlanner {
     val incomingStart =
       incoming.mixInMs?.let { (it - beats * inPeriod).coerceAtLeast(inFirstBar) } ?: inFirstBar
 
-    val swapBeat = (Math.round(beats / 2.0 / 4.0) * 4).toInt().coerceIn(4, beats)
+    // Swap the basslines on a phrase boundary near the middle: 4 bars into an 8-bar blend.
+    val phrase = if (beats >= 32) 16 else if (beats >= 16) 8 else 4
+    val swapBeat =
+      (Math.round(beats / 2.0 / phrase) * phrase).toInt().coerceIn(4, maxOf(4, beats - 4))
     return Plan(
       style = Style.BEAT_MATCH,
       triggerMs = trigger.roundToLong(),
@@ -175,6 +219,7 @@ object AutomixPlanner {
       restoreMs = if (speed == 1f) 0L else (RESTORE_BEATS * outPeriod).roundToLong(),
       bassSwapAt = swapBeat.toFloat() / beats,
       beatFraction = 1f / beats,
+      filters = true,
       reason = "beat match ${beats} beats",
     )
   }
@@ -182,15 +227,16 @@ object AutomixPlanner {
   private fun smooth(out: Track, incoming: Track?, earliest: Long, fadeMs: Long): Plan? {
     val fade = fadeMs.coerceIn(2_000L, 12_000L).toDouble()
     val hardEnd = (out.durationMs - END_MARGIN_MS).toDouble()
-    val audibleEnd = (out.lastSoundMs ?: out.durationMs).coerceAtMost(out.durationMs).toDouble()
+    val audibleEnd = out.audibleEndMs
     var trigger =
-      out.mixOutMs?.toDouble()?.takeIf { it + fade <= audibleEnd } ?: (minOf(audibleEnd, hardEnd) - fade)
+      out.trustedMixOutMs?.toDouble()?.takeIf { it + fade <= audibleEnd }
+        ?: (minOf(audibleEnd, hardEnd) - fade)
     if (out.hasBeat) {
       val bar = out.periodMs * 4
       val snapped = snapNearest(trigger, out.tailBars, bar)
       if (snapped + fade <= hardEnd) trigger = snapped
     }
-    if (trigger < earliest) trigger = earliest.toDouble()
+    trigger = maxOf(trigger, out.earliestMixOutMs, earliest.toDouble())
     val overlap = minOf(fade, hardEnd - trigger)
     if (overlap < MIN_SMOOTH_MS) return null
     return Plan(
@@ -198,6 +244,8 @@ object AutomixPlanner {
       triggerMs = trigger.roundToLong(),
       incomingStartMs = incoming?.firstSoundMs?.coerceIn(0L, 10_000L) ?: 0L,
       overlapMs = overlap.roundToLong(),
+      // Two beats that do not line up clash least with the drums of each thinned in turn.
+      filters = incoming != null && out.hasBeat && incoming.hasBeat,
       reason = when {
         incoming == null -> "smooth: next not analyzed"
         !out.hasBeat || !incoming.hasBeat -> "smooth: no clear beat"
@@ -223,37 +271,50 @@ object AutomixPlanner {
     val outBassCut: Float = 0f,
     /** Bass cut on the incoming song, 0..1. */
     val inBassCut: Float = 0f,
-    /** High-pass sweep on the outgoing song, 0 (open) .. 1 (thin). */
+    /** High-pass sweep on the outgoing song, 0 (open) .. 1 (thin, ~900 Hz). */
     val outHighPass: Float = 0f,
+    /** High-pass on the incoming song, 0 (open) .. 1 (thin). */
+    val inHighPass: Float = 0f,
   )
+
+  /** Incoming high-pass before the bass swap: about 200 Hz, its kick and bass held back. */
+  private const val IN_HIGH_PASS = 0.6f
 
   fun mixAt(plan: Plan, progress: Float): Mix {
     val p = progress.coerceIn(0f, 1f)
     if (plan.style == Style.SMOOTH) {
       val g = EqualPowerCurve.calculateGains(p)
-      return Mix(g.outgoingGain, g.incomingGain)
+      if (!plan.filters) return Mix(g.outgoingGain, g.incomingGain)
+      return Mix(
+        outGain = g.outgoingGain,
+        inGain = g.incomingGain,
+        outHighPass = 0.7f * smoothstep(ramp(p, 0.3f, 1f)),
+        inHighPass = 0.5f * (1f - smoothstep(ramp(p, 0f, 0.6f))),
+      )
     }
-    // Incoming rises over the first 55 %, outgoing falls over the last 55 %.
-    var inGain = sin(PI / 2 * ramp(p, 0f, 0.55f)).toFloat()
-    var outGain = sin(PI / 2 * (1f - ramp(p, 0.45f, 1f))).toFloat()
-    // Both near full in the middle: keep the sum within ~+1.5 dB of one song.
+    // Equal power, the incoming song a little ahead: it rises over the first 3/4 while the
+    // outgoing one falls over the last 3/4, the sum held at constant power.
+    var inGain = sin(PI / 2 * ramp(p, 0f, 0.75f)).toFloat()
+    var outGain = sin(PI / 2 * (1f - ramp(p, 0.25f, 1f))).toFloat()
     val power = inGain * inGain + outGain * outGain
-    if (power > 1.4f) {
-      val k = sqrt(1.4f / power)
+    if (power > 1f) {
+      val k = 1f / sqrt(power)
       inGain *= k
       outGain *= k
     }
-    // Bass swap over one beat, centred on the swap bar.
-    val half = plan.beatFraction / 2
-    val swap = ramp(p, plan.bassSwapAt - half, plan.bassSwapAt + half)
+    // Bass swap over one beat, starting on the swap beat.
+    val swap = smoothstep(ramp(p, plan.bassSwapAt, plan.bassSwapAt + plan.beatFraction))
     return Mix(
       outGain = outGain,
       inGain = inGain,
       outBassCut = swap,
       inBassCut = 1f - swap,
-      outHighPass = ramp(p, plan.bassSwapAt, 1f),
+      outHighPass = smoothstep(ramp(p, plan.bassSwapAt, 1f)),
+      inHighPass = IN_HIGH_PASS * (1f - swap),
     )
   }
+
+  private fun smoothstep(t: Float): Float = t * t * (3 - 2 * t)
 
   /** Incoming playback speed at [sinceBlendEndMs] after the blend, easing back to 1. */
   fun restoreSpeedAt(plan: Plan, sinceBlendEndMs: Long): Float {

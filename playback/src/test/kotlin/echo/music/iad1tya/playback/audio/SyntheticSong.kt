@@ -22,6 +22,8 @@ class SyntheticSong(
   val sampleRate: Int = 44_100,
   /** Constant offset added to the clock: the same song as another stream that starts later. */
   val shiftMs: Double = 0.0,
+  /** Loud open hi-hat / clap on every offbeat, louder than the snare. */
+  val offbeatAccent: Double = 0.0,
 ) {
   val beatMs = 60_000.0 / bpm
   val barMs = beatMs * 4
@@ -61,6 +63,12 @@ class SyntheticSong(
     val inEighth = ((sinceFirst % (beatMs / 2)) + beatMs / 2) % (beatMs / 2)
     if (sinceFirst >= 0) s += 0.08 * exp(-inEighth / 8.0) * (noise.nextDouble() * 2 - 1)
 
+    if (offbeatAccent > 0 && body) {
+      val sinceOff = ((sinceFirst - beatMs / 2) % beatMs + beatMs) % beatMs
+      // Noise moved up around 7 kHz, like a hi-hat: no low end.
+      s += offbeatAccent * exp(-sinceOff / 70.0) * (noise.nextDouble() * 2 - 1) *
+        sin(2 * PI * 7_000.0 * t / 1000.0)
+    }
     // Chord, changing on every bar.
     val root = chordRoots[Math.floorMod(bar, chordRoots.size.toLong()).toInt()]
     val padAmp = if (body) 0.15 else 0.05

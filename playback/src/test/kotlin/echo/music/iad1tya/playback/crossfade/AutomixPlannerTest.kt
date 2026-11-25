@@ -50,10 +50,10 @@ class AutomixPlannerTest {
     assertEquals(Style.BEAT_MATCH, plan.style)
     assertEquals(182_250L, plan.triggerMs)
     assertEquals(120f / 124f, plan.incomingSpeed, 0.0001f)
-    // The blend ends before the outgoing song goes silent.
-    assertTrue(plan.triggerMs + plan.overlapMs <= 198_000)
-    // A whole number of bars.
-    assertEquals(0.0, (plan.overlapMs / 2000.0) % 1.0, 0.001)
+    // The blend ends before the outgoing stream does.
+    assertTrue(plan.triggerMs + plan.overlapMs <= 199_700)
+    // Close tempos get the long blend: 8 bars.
+    assertEquals(16_000L, plan.overlapMs)
   }
 
   @Test
@@ -180,7 +180,7 @@ class AutomixPlannerTest {
     for (i in 0..100) {
       val m = AutomixPlanner.mixAt(plan, i / 100f)
       val power = m.outGain * m.outGain + m.inGain * m.inGain
-      assertTrue("power $power at $i", power in 0.7f..1.41f)
+      assertTrue("power $power at $i", power in 0.95f..1.001f)
     }
   }
 
@@ -196,5 +196,63 @@ class AutomixPlannerTest {
       assertTrue(abs(s - last) < 0.003f)
       last = s
     }
+  }
+
+  @Test
+  fun sixMinuteSongNeverMixesOutMidSong() {
+    // A file cut short at 3:02 once made the analysis think the song ended there.
+    val out = track(durationMs = 360_000, mixOut = 180_250, lastSound = 182_000)
+    for (incoming in listOf(track(), track(bpm = 90f), null)) {
+      val plan = AutomixPlanner.plan(out, incoming, positionMs = 30_000, fadeMs = 6_000)!!
+      assertTrue("${plan.style} at ${plan.triggerMs}", plan.triggerMs >= 300_000)
+      assertTrue(plan.triggerMs + plan.overlapMs <= 359_700)
+    }
+    // A real outro in the last minute is used.
+    val real = AutomixPlanner.plan(track(durationMs = 360_000, mixOut = 330_250, lastSound = 358_000), track(), 30_000, 6_000)!!
+    assertEquals(330_250L, real.triggerMs)
+  }
+
+  @Test
+  fun shortSongKeepsItsLastQuarterRule() {
+    val out = track(durationMs = 120_000, mixOut = 40_250, lastSound = 118_000)
+    val plan = AutomixPlanner.plan(out, track(), positionMs = 10_000, fadeMs = 5_000)!!
+    assertTrue(plan.triggerMs >= 90_000)
+  }
+
+  @Test
+  fun bassSwapLandsOnAPhraseBoundary() {
+    // 4-bar blend (clashing keys): swap after 2 bars; 8-bar blend: after 4 bars.
+    val a = track().copy(keyPitchClass = 0, keyIsMinor = false)
+    val b = track().copy(keyPitchClass = 6, keyIsMinor = false)
+    val short = AutomixPlanner.plan(a, b, 60_000, 5_000)!!
+    assertEquals(8f / 16f, short.bassSwapAt, 0.0001f)
+    val long = AutomixPlanner.plan(track(), track(), 60_000, 5_000)!!
+    assertEquals(16f / 32f, long.bassSwapAt, 0.0001f)
+    // The incoming song is held thin until the swap, then opens.
+    assertTrue(AutomixPlanner.mixAt(long, 0.2f).inHighPass > 0.5f)
+    assertEquals(0f, AutomixPlanner.mixAt(long, 0.6f).inHighPass, 0.001f)
+  }
+
+  @Test
+  fun smoothWithBeatsThinsTheDrumsButBalladsStayClean() {
+    val beats = AutomixPlanner.plan(track(), track(bpm = 90f), 60_000, 6_000)!!
+    assertTrue(beats.filters)
+    assertTrue(AutomixPlanner.mixAt(beats, 0.9f).outHighPass > 0.3f)
+    val ballad = AutomixPlanner.plan(track(confidence = 0f), track(confidence = 0f), 60_000, 6_000)!!
+    assertFalse(ballad.filters)
+    assertEquals(0f, AutomixPlanner.mixAt(ballad, 0.9f).outHighPass, 0f)
+  }
+
+  @Test
+  fun bestNextIsMovedUpOnlyWhenClearlyBetter() {
+    val out = track(bpm = 124f).copy(keyPitchClass = 9, keyIsMinor = true) // A minor
+    val far = track(bpm = 92f)
+    val close = track(bpm = 125f).copy(keyPitchClass = 0, keyIsMinor = false) // C major
+    // The next one only crossfades; the third beat-matches in a relative key.
+    assertEquals(2, AutomixPlanner.pickBestNext(out, listOf(far, null, close, far)))
+    // The next one already beat-matches: the order is kept.
+    assertNull(AutomixPlanner.pickBestNext(out, listOf(track(bpm = 122f), close)))
+    // Nothing better: kept.
+    assertNull(AutomixPlanner.pickBestNext(out, listOf(far, null, far)))
   }
 }

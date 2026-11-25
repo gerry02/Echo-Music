@@ -87,6 +87,7 @@ import echo.music.iad1tya.constants.AutoDownloadOnLikeKey
 import echo.music.iad1tya.constants.AutoLoadMoreKey
 import echo.music.iad1tya.constants.AutoSkipNextOnErrorKey
 import echo.music.iad1tya.constants.AutomixCrossfadeKey
+import echo.music.iad1tya.constants.AutomixPickBestNextKey
 import echo.music.iad1tya.constants.CrossfadeDurationKey
 import echo.music.iad1tya.constants.CrossfadeEnabledKey
 import echo.music.iad1tya.constants.CrossfadeGaplessKey
@@ -306,6 +307,10 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
   }
 
   private var automixEnabled = false
+  /** Opt-in: in radio queues, move the best-mixing of the next songs up to play next. */
+  @Volatile private var automixPickBestNext = false
+  /** The song whose next one was already chosen, so the choice is made once per song. */
+  private var bestNextPickedFor: String? = null
   private var activeAutomixPlan: AutomixPlan? = null
 
   /** A secondary player buffered ahead of the trigger so the blend doesn't cold-start. */
@@ -379,6 +384,15 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
   /** Stream measurements of lossless files, by "mediaId:head" / "mediaId:tail". */
   private val streamProbes =
     java.util.concurrent.ConcurrentHashMap<String, Pair<Long, BeatAnalyzer.Result?>>()
+
+  /** Songs analyzed from a file cut short in this session: not fetched again until restart. */
+  private val partiallyAnalyzed = java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap<String, Boolean>())
+
+  /**
+   * How long an incoming player takes from play() to sound, learned from the phase lock's first
+   * measurement of each blend.
+   */
+  @Volatile private var learnedStartLatencyMs = 60L
 
   /** Returns the incoming player to the user's tempo after a stretched blend. */
   private var tempoRestoreJob: Job? = null
@@ -1391,6 +1405,11 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
           scheduleCrossfade()
         }
       }
+
+    dataStore.data
+      .map { it[AutomixPickBestNextKey] ?: false }
+      .distinctUntilChanged()
+      .collect(scope) { automixPickBestNext = it }
 
     // Keep cached preferences in sync so Player.Listener callbacks can read
     // them without blocking the main thread.
@@ -5669,6 +5688,11 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
 
     crossfadeTriggerJob = scope.launch {
       if (!automixEnabled) automixDebugInfo.value = null
+      // Choosing the next song changes the pair: before any planning.
+      if (automixEnabled && pickBestNextSong()) {
+        scheduleCrossfade()
+        return@launch
+      }
       // Plan first: it enqueues analysis for current+next, which must not wait
       // behind slower far-queue lookahead fetches.
       val planResult =
@@ -5694,7 +5718,10 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
           scheduleCrossfade()
           return@launch
         }
-        val remaining = triggerTime - position
+        // A beat match starts the incoming player its usual start-up latency early, so its first
+        // beat sounds on the outgoing one instead of after it.
+        val startEarlyMs = if (plan?.isBeatMatch == true) learnedStartLatencyMs else 0L
+        val remaining = triggerTime - startEarlyMs - position
         if (remaining <= 0) break
         val leadTime = preArmManager.currentLeadTimeMs
         if (!prebufferStarted && remaining <= leadTime) {
@@ -5800,6 +5827,49 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
     return AutomixPlanResult(plan = plan, pairAnalyzed = inBeat != null, replanAtMs = replanAtMs)
   }
 
+  /**
+   * "Pick the best next song": in a radio queue (not shuffled), moves the one of the next
+   * [BEST_NEXT_CANDIDATES] songs that mixes best with this one (same tempo, compatible key) up to
+   * play next, when clearly better than the current next. Once per song; waits for the candidates'
+   * analysis until a minute and a half before the end. Returns true when it moved a song.
+   */
+  private suspend fun pickBestNextSong(): Boolean {
+    if (!automixPickBestNext || player.shuffleModeEnabled) return false
+    if (player.repeatMode == REPEAT_MODE_ONE) return false
+    val queue = currentQueue
+    val radio =
+      queue is echo.music.iad1tya.playback.queues.YouTubeQueue ||
+        queue is echo.music.iad1tya.playback.queues.YouTubeAlbumRadio ||
+        queue is echo.music.iad1tya.playback.queues.LocalAlbumRadio ||
+        queue is echo.music.iad1tya.playback.queues.LocalMixQueue
+    if (!radio) return false
+    val currentId = player.currentMediaItem?.mediaId ?: return false
+    if (bestNextPickedFor == currentId) return false
+    val current = player.currentMediaItemIndex
+    val last = minOf(current + BEST_NEXT_CANDIDATES, player.mediaItemCount - 1)
+    if (last - current < 2) return false
+    val ids = (current + 1..last).map { player.getMediaItemAt(it).mediaId }
+    val (outBeat, candidates) =
+      withContext(Dispatchers.IO) {
+        database.beatInfo(currentId) to ids.map { database.beatInfo(it) }
+      }
+    val decideBy = player.duration.takeIf { it > 0 }?.minus(90_000) ?: 0L
+    if (outBeat == null || candidates.any { it == null }) {
+      if (player.currentPosition < decideBy) return false // analysis still coming
+    }
+    bestNextPickedFor = currentId
+    outBeat ?: return false
+    val outTrack = trackFromEntity(outBeat, player.duration)
+    val best =
+      AutomixPlanner.pickBestNext(
+        outTrack,
+        candidates.map { it?.let { e -> trackFromEntity(e, 0L) } },
+      ) ?: return false
+    Timber.tag(TAG).d("Automix: %s mixes better, moved up to play next", ids[best])
+    player.moveMediaItem(current + 1 + best, current + 1)
+    return true
+  }
+
   /** Whether [mediaId] plays (or will play, its start prefetched) from an addon's lossless file. */
   private fun streamIsLossless(mediaId: String): Boolean =
     isPlayingFromAddon(mediaId) ||
@@ -5820,9 +5890,14 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
     mediaId: String,
     tail: Boolean,
   ): AutomixPlanner.Track {
+    val base = trackFromEntity(entity, durationMs)
+    if (mediaId.isLocalMediaId() || !streamIsLossless(mediaId) || entity.bpm <= 0f) return base
+    return measuredTrack(base, entity, durationMs, mediaId, tail)
+  }
+
+  private fun trackFromEntity(entity: BeatInfoEntity, durationMs: Long): AutomixPlanner.Track {
     fun Long?.valid(): Long? = this?.takeIf { it >= 0 }
-    val base =
-      AutomixPlanner.Track(
+    return AutomixPlanner.Track(
         bpm = entity.bpm,
         confidence = entity.confidence,
         firstBeatOffsetMs = entity.firstBeatOffsetMs,
@@ -5837,8 +5912,15 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
         keyPitchClass = entity.keyPitchClass,
         keyIsMinor = entity.keyIsMinor,
       )
-    if (mediaId.isLocalMediaId() || !streamIsLossless(mediaId) || entity.bpm <= 0f) return base
+  }
 
+  private suspend fun measuredTrack(
+    base: AutomixPlanner.Track,
+    entity: BeatInfoEntity,
+    durationMs: Long,
+    mediaId: String,
+    tail: Boolean,
+  ): AutomixPlanner.Track {
     val probe = probeLosslessStream(mediaId, entity.bpm, tail)
     val anchor = if (tail) probe?.tailAnchorMs else probe?.headAnchorMs
     if (probe != null && anchor != null) {
@@ -5924,7 +6006,7 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
         player.shuffleModeEnabled,
       )
     if (index == C.INDEX_UNSET) return
-    repeat(2) {
+    repeat(if (automixPickBestNext) BEST_NEXT_CANDIDATES - 1 else 2) {
       index = timeline.getNextWindowIndex(index, REPEAT_MODE_OFF, player.shuffleModeEnabled)
       if (index == C.INDEX_UNSET) return
       maybeAnalyzeBeat(player.getMediaItemAt(index).mediaId, BeatAnalysisPriority.LOOKAHEAD)
@@ -5990,6 +6072,8 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
     val existing = database.beatInfo(mediaId)
     // Rows of an older analysis are redone once: they lack the bars measured at the edges.
     if (existing != null && existing.analysisVersion >= BeatAnalyzer.VERSION) return
+    // Analyzed from a file cut short already in this session: wait for a later one.
+    if (existing != null && mediaId in partiallyAnalyzed) return
     Timber.tag(TAG).d("Beat analysis starting for %s (%s)", mediaId, priority)
 
     val result: BeatAnalyzer.Result?
@@ -6031,6 +6115,7 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
             .format(it.bpm, it.confidence, it.mixInPointMs, it.mixOutPointMs)
         } ?: "failed (complete=$dataComplete)",
       )
+    if (!dataComplete) partiallyAnalyzed.add(mediaId)
     if (result == null && !dataComplete) return // partial data; retry when fully cached
 
     val entity =
@@ -6044,7 +6129,8 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
           mixOutPointMs = it.mixOutPointMs ?: -1L,
           keyPitchClass = it.keyPitchClass,
           keyIsMinor = it.keyIsMinor,
-          analysisVersion = BeatAnalyzer.VERSION,
+          // A file cut short has no real end measured: analyze it again when it comes back.
+          analysisVersion = if (dataComplete) BeatAnalyzer.VERSION else BeatAnalyzer.VERSION - 1,
           downbeatOffsetMs = it.downbeatOffsetMs,
           headAnchorMs = it.headAnchorMs,
           tailAnchorMs = it.tailAnchorMs,
@@ -6071,7 +6157,14 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
       val nextIndex = player.nextMediaItemIndex
       val nextId =
         if (nextIndex != C.INDEX_UNSET) player.getMediaItemAt(nextIndex).mediaId else null
-      if (mediaId == currentId || mediaId == nextId) scheduleCrossfade()
+      val isCandidate =
+        automixPickBestNext &&
+          bestNextPickedFor != currentId &&
+          (1..BEST_NEXT_CANDIDATES).any { offset ->
+            val i = player.currentMediaItemIndex + offset
+            i < player.mediaItemCount && player.getMediaItemAt(i).mediaId == mediaId
+          }
+      if (mediaId == currentId || mediaId == nextId || isCandidate) scheduleCrossfade()
     }
   }
 
@@ -6416,10 +6509,11 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
             } catch (e: Exception) {
               break
             }
-            if (djPlan.isBeatMatch) {
+            if (djPlan.transition.filters) {
               outDuck?.setMix(mix.outBassCut)
               outDuck?.setHighPass(mix.outHighPass)
               inDuck?.setMix(mix.inBassCut)
+              inDuck?.setHighPass(mix.inHighPass)
             }
             if (progress < djPlan.transition.bassSwapAt) phaseLock?.step(outPos)
             if (progress >= 1f) break
@@ -6497,6 +6591,10 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
       val speed = plan.transition.incomingSpeed
       val expected = plan.incomingStartMs + (outPos - plan.triggerTimeMs) * speed
       val errorMs = (player.currentPosition - expected).toLong()
+      if (lastErrorMs == null && kotlin.math.abs(errorMs) <= PHASE_GIVE_UP_MS) {
+        // Behind = it took longer to start than assumed: start earlier next time.
+        learnedStartLatencyMs = (learnedStartLatencyMs - errorMs / 2).coerceIn(0L, 250L)
+      }
       lastErrorMs = errorMs
       automixDebugInfo.value = automixDebugInfo.value?.copy(phaseErrorMs = errorMs)
       when {
@@ -6619,6 +6717,8 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
     /** Waiting for data this soon after a seek or a track change is not a stall. */
     private const val STALL_GRACE_MS = 3_000L
     private const val CACHE_SOURCE_KEY = "echo-source"
+    /** How many of the next songs "Pick the best next song" chooses from. */
+    private const val BEST_NEXT_CANDIDATES = 4
     /** Beat offset the automix phase lock leaves alone, in ms. */
     private const val PHASE_DEADBAND_MS = 12
     /** Speed nudges per blend at most. */

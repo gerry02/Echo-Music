@@ -25,7 +25,7 @@ import timber.log.Timber
 object BeatAnalyzer {
 
   /** Bumped when the analysis changes so stored rows are redone once. */
-  const val VERSION = 2
+  const val VERSION = 3
 
   data class Result(
     val bpm: Float,
@@ -87,11 +87,17 @@ object BeatAnalyzer {
   /** Bar-phase confidence from which a window's own downbeat beats the middle grid's. */
   private const val LOCAL_BAR_CONFIDENCE = 0.2f
 
+  /** How far before the stated duration a tail window may stop and still count as reaching it. */
+  private const val TAIL_END_SLACK_MS = 2_500L
+
   /** Silence threshold, about -50 dBFS RMS. */
   private const val SILENCE_RMS = 0.0032f
 
-  /** Hard cap on bytes fetched for analysis. Keeps automix responsive on slow streams. */
-  private const val MAX_FETCH_BYTES = 5L * 1024 * 1024
+  /**
+   * Hard cap on bytes fetched for analysis: a 10-minute song at 160 kbit/s. A file cut short looks
+   * like a song that ends early, so a tail window that stops before the end is discarded anyway.
+   */
+  private const val MAX_FETCH_BYTES = 12L * 1024 * 1024
 
   fun analyzeUri(
     context: Context,
@@ -233,9 +239,15 @@ object BeatAnalyzer {
         if (wantMiddle) window(max(0L, durationUs / 2 - WINDOW_US / 2), WINDOW_US) else null
       if (wantMiddle && middle == null) return null
       val head = if (wantHead && durationUs > HEAD_WINDOW_US) window(0L, HEAD_WINDOW_US) else null
+      // Only a tail that reaches the real end tells where the song ends: in a file cut short the
+      // data runs out mid-song, which would read as the song's last sound.
       val tail =
         if (wantTail && durationUs > TAIL_WINDOW_US) {
-          window(durationUs - TAIL_WINDOW_US, TAIL_WINDOW_US)
+          window(durationUs - TAIL_WINDOW_US, TAIL_WINDOW_US)?.takeIf { (pcm, startMs) ->
+            val reaches = startMs + pcm.durationMs >= durationUs / 1000 - TAIL_END_SLACK_MS
+            if (!reaches) Timber.tag(TAG).d("Tail window stops at %d ms of %d: ignored", startMs + pcm.durationMs, durationUs / 1000)
+            reaches
+          }
         } else null
       if (shouldCancel()) return null
 
@@ -310,9 +322,10 @@ object BeatAnalyzer {
     var midDownbeatMs: Double? = null
     if (midSpectrum != null) {
       val periodFrames = midSpectrum.msToFrame(periodMs)
-      val phase = BeatDsp.beatPhase(midSpectrum.flux, periodFrames) ?: return null
-      midBeatMs = windows.middleStartMs + midSpectrum.frameToMs(phase.phaseFrames)
-      val bar = BeatDsp.downbeatPhase(midSpectrum, phase.phaseFrames, periodFrames)
+      val comb = BeatDsp.beatPhase(midSpectrum.flux, periodFrames) ?: return null
+      val phase = BeatDsp.onBeatPhase(midSpectrum, comb.phaseFrames, periodFrames)
+      midBeatMs = windows.middleStartMs + midSpectrum.frameToMs(phase)
+      val bar = BeatDsp.downbeatPhase(midSpectrum, phase, periodFrames)
       midDownbeatMs = midBeatMs + (bar?.first ?: 0) * periodMs
     }
     val key = midSpectrum?.let { BeatDsp.key(it) }
@@ -320,9 +333,11 @@ object BeatAnalyzer {
     // Local beat grids where the mixes happen.
     fun local(spectrum: BeatDsp.Spectrum?, startMs: Long): LocalGrid? {
       spectrum ?: return null
-      val phase = BeatDsp.beatPhase(spectrum.flux, spectrum.msToFrame(periodMs)) ?: return null
-      if (phase.strength < MIN_LOCAL_BEAT_STRENGTH) return null
-      return LocalGrid(startMs + spectrum.frameToMs(phase.phaseFrames), spectrum, startMs)
+      val periodFrames = spectrum.msToFrame(periodMs)
+      val comb = BeatDsp.beatPhase(spectrum.flux, periodFrames) ?: return null
+      if (comb.strength < MIN_LOCAL_BEAT_STRENGTH) return null
+      val phase = BeatDsp.onBeatPhase(spectrum, comb.phaseFrames, periodFrames)
+      return LocalGrid(startMs + spectrum.frameToMs(phase), spectrum, startMs)
     }
     var headGrid = local(headSpectrum, windows.headStartMs)
     var tailGrid = local(tailSpectrum, windows.tailStartMs)

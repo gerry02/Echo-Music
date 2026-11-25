@@ -217,6 +217,35 @@ object BeatDsp {
     return BeatPhase(bestPhase, (bestSum / mean).toFloat())
   }
 
+  /**
+   * The comb can lock onto the offbeats (loud hi-hats or claps on the "and"): the grid then has the
+   * right tempo but sits half a beat off, and two songs mixed on it sound against each other. The
+   * beat is where the kick and the bass hit, so of the phase and the phase half a beat later this
+   * keeps the one with more low-band onset energy, broadband onsets breaking near ties.
+   */
+  fun onBeatPhase(spectrum: Spectrum, phaseFrames: Double, periodFrames: Double): Double {
+    val shifted = phaseFrames + periodFrames / 2
+    fun score(phase: Double): Pair<Double, Double> {
+      var low = 0.0
+      var all = 0.0
+      var t = phase
+      while (t < spectrum.frames - 1) {
+        low += at(spectrum.lowFlux, t)
+        all += at(spectrum.flux, t)
+        t += periodFrames
+      }
+      return low to all
+    }
+    val (lowA, allA) = score(phaseFrames)
+    val (lowB, allB) = score(shifted)
+    val lowTotal = lowA + lowB
+    val allTotal = allA + allB
+    if (lowTotal <= 0.0 || allTotal <= 0.0) return phaseFrames
+    val a = lowA / lowTotal + 0.5 * allA / allTotal
+    val b = lowB / lowTotal + 0.5 * allB / allTotal
+    return if (b > a * 1.1) shifted % periodFrames else phaseFrames
+  }
+
   /** The first beat of a bar among a grid of beats: (index 0..3 of the first downbeat, confidence). */
   fun downbeatPhase(spectrum: Spectrum, phaseFrames: Double, periodFrames: Double): Pair<Int, Float>? {
     val beats = ArrayList<Double>()
