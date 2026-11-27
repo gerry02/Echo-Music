@@ -47,8 +47,8 @@ class MixBench {
 
     val ra = analyze(a) ?: error("A: analysis failed")
     val rb = analyze(b) ?: error("B: analysis failed")
-    log("A analysis: %.2f bpm conf %.2f tailBar %s mixOut %s end %s; %s".format(ra.bpm, ra.confidence, ra.tailAnchorMs, ra.mixOutPointMs, ra.lastSoundMs, ra.phaseNote))
-    log("B analysis: %.2f bpm conf %.2f headBar %s mixIn %s start %s; %s".format(rb.bpm, rb.confidence, rb.headAnchorMs, rb.mixInPointMs, rb.firstSoundMs, rb.phaseNote))
+    log("A analysis: %.2f bpm conf %.2f tailBar %s mixOut %s end %s last voice %s; %s".format(ra.bpm, ra.confidence, ra.tailAnchorMs, ra.mixOutPointMs, ra.lastSoundMs, ra.lastVocalMs, ra.phaseNote))
+    log("B analysis: %.2f bpm conf %.2f headBar %s mixIn %s start %s first voice %s; %s".format(rb.bpm, rb.confidence, rb.headAnchorMs, rb.mixInPointMs, rb.firstSoundMs, rb.firstVocalMs, rb.phaseNote))
 
     val easeMs = 4_000L
     val plan =
@@ -169,11 +169,14 @@ class MixBench {
       lastSoundMs = r.lastSoundMs,
       keyPitchClass = r.keyPitchClass,
       keyIsMinor = r.keyIsMinor,
+      firstVocalMs = r.firstVocalMs,
+      lastVocalMs = r.lastVocalMs,
     )
 
   /** The same windows the phone analyzes: 18 s mid, the first 20 s, the last 30 s. */
   private fun analyze(x: FloatArray, useTracker: Boolean = System.getProperty("mix.tracker") != "dsp"): BeatAnalyzer.Result? {
     BeatAnalyzer.tracker = if (useTracker) beatThis else null
+    BeatAnalyzer.vocals = if (useTracker) silero else null
     val frames = x.size / 2
     fun mono(fromMs: Long, lenMs: Long): Pair<MonoPcm, Long> {
       val start = (fromMs * rate / 1000).toInt().coerceIn(0, frames)
@@ -265,6 +268,10 @@ class MixBench {
         File(dir, "mel_spectrogram.onnx").readBytes(),
         File(dir, "beat_this_small.onnx").readBytes(),
       )
+    }
+    /** Silero VAD from the app's assets. */
+    private val silero by lazy {
+      echo.music.iad1tya.playback.audio.SileroVocalDetector(File("src/main/assets/silero/silero_vad.onnx").readBytes())
     }
     private const val BLOCK = 1_152
     private const val LEAD_MS = 20_000L

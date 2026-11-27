@@ -25,7 +25,7 @@ import timber.log.Timber
 object BeatAnalyzer {
 
   /** Bumped when the analysis changes so stored rows are redone once. */
-  const val VERSION = 6
+  const val VERSION = 7
 
   data class Result(
     val bpm: Float,
@@ -53,6 +53,10 @@ object BeatAnalyzer {
     val durationMs: Long = 0L,
     /** How the beat phase was chosen, for the log. */
     val phaseNote: String = "",
+    /** Where the first voice starts (singing, rap), when the start was analysed for it. */
+    val firstVocalMs: Long? = null,
+    /** Where the last voice ends, when the end was analysed for it. */
+    val lastVocalMs: Long? = null,
   )
 
   /** Decoded parts of a song, positions in ms from its start. */
@@ -515,6 +519,26 @@ object BeatAnalyzer {
     val phaseNote = g.phaseNote
     val firstSound = windows.head?.let { firstSoundMs(it, windows.headStartMs) }
     val lastSound = windows.tail?.let { lastSoundMs(it, windows.tailStartMs) }
+    // Voices at the start and the end: none in a window means before (or after) it.
+    val detector = vocals
+    val firstVocal =
+      windows.head?.let { head ->
+        detector?.let { d ->
+          runCatching { d.vocals(head) }.getOrNull()?.let { v ->
+            // A shout or a sample in the intro is not the first line: one of 1.5 s at least.
+            v.firstOrNull { it.last - it.first >= 1_500 }?.first?.plus(windows.headStartMs)
+              ?: (windows.headStartMs + head.durationMs)
+          }
+        }
+      }
+    val lastVocal =
+      windows.tail?.let { tail ->
+        detector?.let { d ->
+          runCatching { d.vocals(tail) }.getOrNull()?.let { v ->
+            v.lastOrNull { it.last - it.first >= 1_000 }?.last?.plus(windows.tailStartMs) ?: windows.tailStartMs
+          }
+        }
+      }
 
     // A bar grid near the start, best measured there.
     val headBars = headAnchor ?: midDownbeatMs ?: midBeatMs
@@ -558,6 +582,8 @@ object BeatAnalyzer {
       lastSoundMs = lastSound,
       durationMs = windows.durationMs,
       phaseNote = listOf(phaseNote, windows.note).filter { it.isNotBlank() }.joinToString("; "),
+      firstVocalMs = firstVocal,
+      lastVocalMs = lastVocal,
     )
   }
 
@@ -566,6 +592,9 @@ object BeatAnalyzer {
    * when it finds too few beats, the onset statistics below are used.
    */
   @Volatile var tracker: BeatTracker? = null
+
+  /** The voice detector (Silero VAD, loaded by the app): where songs sing, for the mix. */
+  @Volatile var vocals: VocalDetector? = null
 
   /**
    * A beat grid from the tracker's beats: the tempo from a straight line through each window's

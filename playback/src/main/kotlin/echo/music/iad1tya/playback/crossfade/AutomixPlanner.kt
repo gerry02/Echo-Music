@@ -59,6 +59,10 @@ object AutomixPlanner {
     val keyIsMinor: Boolean? = null,
     /** False when the beat positions were not measured on the stream that plays. */
     val gridTrusted: Boolean = true,
+    /** Where the first voice (singing, rap) starts; null when not known. */
+    val firstVocalMs: Long? = null,
+    /** Where the last voice ends; null when not known. */
+    val lastVocalMs: Long? = null,
   ) {
     val periodMs: Double
       get() = 60_000.0 / bpm
@@ -264,11 +268,41 @@ object AutomixPlanner {
     while (beats > MIN_BLEND_BEATS && trigger + beats * outPeriod > hardEnd) beats -= 4
     if (trigger + beats * outPeriod > hardEnd) return null
 
+    // Two voices never over each other, and no voice faded mid-line: the outgoing song fades
+    // after the swap, so its last line should end by then; later if the outro leaves room.
+    out.lastVocalMs?.toDouble()?.let { lastLine ->
+      if (lastLine > trigger + beats / 2 * outPeriod) {
+        // Later, as far as the end allows; a 16-bar blend gives way to 8 bars sooner than to a
+        // voice faded mid-line.
+        val options = listOf(beats, 32, 24, 16).filter { it <= beats }.distinct()
+        for ((i, b) in options.withIndex()) {
+          val latest = snapDown(hardEnd - b * outPeriod, out.tailBars, outBar)
+          val want = snapUp(lastLine - b / 2 * outPeriod, out.tailBars, outBar)
+          if (want <= latest) {
+            beats = b
+            trigger = maxOf(trigger, want)
+            break
+          }
+          if (i == options.lastIndex) {
+            beats = b
+            trigger = maxOf(trigger, latest)
+          }
+        }
+      }
+    }
+    val swapBeatGuess = beats / 2
+
     val overlapMs = beats * outPeriod
     // The incoming body arrives as the blend ends: start its intro that many beats earlier.
-    val incomingStart =
+    var incomingStart =
       incoming.trustedMixInMs?.let { (it - beats * inPeriod).coerceAtLeast(inFirstBar) }
         ?.coerceAtMost(MAX_MIX_IN_MS.toDouble()) ?: inFirstBar
+    // Its first voice only once it has taken over (after the swap), at best after the blend.
+    incoming.firstVocalMs?.toDouble()?.let { firstLine ->
+      if (firstLine < incomingStart + swapBeatGuess * inPeriod) {
+        incomingStart = snapDown(firstLine - beats * inPeriod, incoming.headBars, inBar).coerceAtLeast(inFirstBar)
+      }
+    }
 
     // Swap the basslines on a phrase boundary near the middle: 4 bars into an 8-bar blend.
     val phrase = if (beats >= 32) 16 else if (beats >= 16) 8 else 4

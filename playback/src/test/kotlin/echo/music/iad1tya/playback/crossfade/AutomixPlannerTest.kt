@@ -305,4 +305,18 @@ class AutomixPlannerTest {
     // Nothing better: kept.
     assertNull(AutomixPlanner.pickBestNext(out, listOf(far, null, far)))
   }
+
+  @Test
+  fun twoVoicesAreNeverLaidOverEachOther() {
+    // The outgoing song sings until 188 s: the blend's swap (after which it fades) comes after.
+    val singer = track(mixOut = 166_250).copy(lastVocalMs = 188_000)
+    val plan = AutomixPlanner.plan(singer, track(), 60_000, 5_000)!!
+    val swapMs = plan.triggerMs + plan.bassSwapAt * plan.overlapMs
+    assertTrue("swap at $swapMs before the last line", swapMs >= 188_000 - 1)
+    // The next song's first line comes once it has taken over, not under the outgoing one.
+    val next = track(mixIn = 30_250).copy(firstVocalMs = 12_000)
+    val p2 = AutomixPlanner.plan(track(), next, 60_000, 5_000)!!
+    val takenOver = p2.incomingStartMs + p2.bassSwapAt * p2.overlapMs * p2.incomingSpeed
+    assertTrue("its first line at 12 s, it takes over at $takenOver", takenOver <= 12_000 + 1)
+  }
 }

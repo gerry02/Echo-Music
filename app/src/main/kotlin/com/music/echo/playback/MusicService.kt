@@ -1527,6 +1527,14 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
               }
             }
           automixLog("beat tracker: Beat This! loaded")
+          runCatching {
+              BeatAnalyzer.vocals =
+                echo.music.iad1tya.playback.audio.SileroVocalDetector(
+                  assets.open("silero/silero_vad.onnx").use { it.readBytes() }
+                )
+              automixLog("voice detector: Silero VAD loaded")
+            }
+            .onFailure { automixLog("voice detector: Silero VAD not loaded (${it.message})") }
         } catch (e: Throwable) {
           automixLog("beat tracker: Beat This! not loaded (${e.message}), onset statistics instead")
         }
@@ -6319,6 +6327,8 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
         lastSoundMs = entity.lastSoundMs,
         keyPitchClass = entity.keyPitchClass,
         keyIsMinor = entity.keyIsMinor,
+        firstVocalMs = entity.firstVocalMs,
+        lastVocalMs = entity.lastVocalMs,
       )
   }
 
@@ -6575,6 +6585,8 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
           firstSoundMs = it.firstSoundMs,
           lastSoundMs = it.lastSoundMs,
           analyzedDurationMs = it.durationMs.takeIf { d -> d > 0 },
+          firstVocalMs = it.firstVocalMs,
+          lastVocalMs = it.lastVocalMs,
         )
       }
         ?: BeatInfoEntity(

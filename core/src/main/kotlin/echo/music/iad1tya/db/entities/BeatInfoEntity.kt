@@ -32,4 +32,8 @@ data class BeatInfoEntity(
   val lastSoundMs: Long? = null,
   /** Length of the audio analyzed, to tell when a different edit of the song plays. */
   val analyzedDurationMs: Long? = null,
+  /** Where the first voice starts; null when the song was not analysed for voices. */
+  @ColumnInfo(defaultValue = "NULL") val firstVocalMs: Long? = null,
+  /** Where the last voice ends. */
+  @ColumnInfo(defaultValue = "NULL") val lastVocalMs: Long? = null,
 )
