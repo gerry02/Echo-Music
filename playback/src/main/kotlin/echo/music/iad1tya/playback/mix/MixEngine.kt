@@ -87,6 +87,8 @@ class MixEngine(val rate: Int, val channels: Int = 2) {
   private var playerBuffer = FloatArray(0)
   private var playerBufferStart = 0L
   private var playerBufferFrames = 0
+  /** How alike the player's audio and ours were at the match (1 = the same samples). */
+  private var lastMatchScore = 0.0
   /** Player frame = our raw frame - offset, once matched. */
   private var matchOffset: Long? = null
 
@@ -182,6 +184,20 @@ class MixEngine(val rate: Int, val channels: Int = 2) {
   val handoverFrame: Long?
     get() = if (state == State.READY || state == State.HANDING_OVER) nextOutputRawFrame() else null
 
+  /**
+   * The next song's frame our next output sample is of, as far as it is playing: exact once it
+   * plays at its own tempo ([handoverFrame]), within the stretcher's 10 ms during the blend. For the
+   * player's clock, which follows the next song as soon as it is handed over.
+   */
+  val incomingPositionFrame: Long?
+    get() =
+      when (state) {
+        State.BLENDING, State.EASING ->
+          (stretcher.nominalInputPosition - pendingFrames * stretcher.speed).toLong()
+        State.READY, State.HANDING_OVER -> nextOutputRawFrame()
+        else -> null
+      }
+
   /** The player was asked to move to the next song: from now on [fill] and [processIncoming]. */
   fun startHandover() {
     if (state == State.READY) {
@@ -219,7 +235,7 @@ class MixEngine(val rate: Int, val channels: Int = 2) {
       // Our decode must reach past the player's first frames by the whole search range.
       readAheadTo(playerBufferStart + MATCH_FRAMES + MATCH_RANGE + 1)
       matchOffset = findOffset()
-      note = "player matched at offset ${matchOffset} frames"
+      note = "player matched at offset ${matchOffset} frames (score ${"%.3f".format(lastMatchScore)})"
     }
     val offset = matchOffset!!
     // Our next frame is raw frame q; the player's same sample is q - offset.
@@ -401,8 +417,7 @@ class MixEngine(val rate: Int, val channels: Int = 2) {
         best = d.toLong()
       }
     }
-    note += "; match score ${"%.3f".format(bestScore)}"
-    if (bestScore < 0.5) note += " (weak)"
+    lastMatchScore = bestScore
     return best
   }
 

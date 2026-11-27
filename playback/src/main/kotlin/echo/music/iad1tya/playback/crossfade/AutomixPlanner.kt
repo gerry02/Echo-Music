@@ -21,7 +21,7 @@ import kotlin.math.sqrt
 object AutomixPlanner {
 
   /** Largest time stretch of the incoming song; beyond it the change of tempo is audible. */
-  const val MAX_TEMPO_CHANGE = 0.06f
+  const val MAX_TEMPO_CHANGE = 0.08f
   const val MIN_CONFIDENCE = 0.3f
   private const val MAX_BLEND_MS = 24_000.0
   private const val MIN_BLEND_BEATS = 8

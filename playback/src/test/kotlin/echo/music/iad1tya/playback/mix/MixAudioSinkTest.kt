@@ -33,7 +33,9 @@ class MixAudioSinkTest {
     override fun setListener(listener: AudioSink.Listener) {}
     override fun supportsFormat(format: Format) = true
     override fun getFormatSupport(format: Format) = AudioSink.SINK_FORMAT_SUPPORTED_DIRECTLY
-    override fun getCurrentPositionUs(sourceEnded: Boolean) = written.size / 2 * 1_000_000L / 48_000
+    /** What is heard lags what was written by the output's buffer, 200 ms. */
+    override fun getCurrentPositionUs(sourceEnded: Boolean) =
+      maxOf(0L, written.size / 2 * 1_000_000L / 48_000 - 200_000L)
     override fun configure(inputFormat: Format, specifiedBufferSize: Int, outputChannels: IntArray?) {}
     override fun play() {}
     override fun handleDiscontinuity() {}
@@ -88,7 +90,13 @@ class MixAudioSinkTest {
       .build()
 
   @Test
-  fun aWholeMixThroughTheRoutingSinkBlendsThenHandsOverWithoutCancellingItself() {
+  fun aWholeMixThroughTheRoutingSinkBlendsThenHandsOverWithoutCancellingItself() = wholeMix(sameOffset = false)
+
+  /** After a seek ExoPlayer may start the next song at the same renderer offset: no offset call. */
+  @Test
+  fun theHandoverWorksWhenTheNextSongKeepsTheSameStreamOffset() = wholeMix(sameOffset = true)
+
+  private fun wholeMix(sameOffset: Boolean) {
     val a = noise(40.0, 1)
     val b = noise(60.0, 2)
     val out = RecordingSink()
@@ -145,6 +153,9 @@ class MixAudioSinkTest {
     // Through the blend.
     feedA(rate * 18 + block)
     assertEquals(MixEngine.State.READY, engine.state)
+    // Still the outgoing song's time for the player.
+    val beforeUs = sink.getCurrentPositionUs(false) - offsetA
+    assertTrue("before the handover the player is at A's ${beforeUs / 1000} ms", abs(beforeUs - 17_800_000L) < 100_000)
     val handoverOut = out.written.size / 2
     val q = engine.handoverFrame!!
 
@@ -156,16 +167,30 @@ class MixAudioSinkTest {
     sink.reset()
     assertEquals("the handover cancelled itself: $events", MixEngine.State.HANDING_OVER, engine.state)
     assertEquals("the real output was flushed during the handover", 0, out.flushes)
-    // B, from where it was sent (40 ms off), with its own stream offset.
-    val offsetB = offsetA + 40_000_000L
+    // From the handover on the player hears the next song: its clock is in B's time at once.
+    val offsetB = if (sameOffset) offsetA else offsetA + 40_000_000L
+    if (!sameOffset) sink.setOutputStreamOffsetUs(offsetB)
+    val afterUs = sink.getCurrentPositionUs(false) - offsetB
+    val heardB = q * 1_000_000L / rate - 200_000L
+    assertTrue("right after the handover the player is at ${afterUs / 1000} ms, B is at ${heardB / 1000} ms", abs(afterUs - heardB) < 30_000)
+    // B, from where it was sent (40 ms off).
     sink.configure(format, 0, null)
-    sink.setOutputStreamOffsetUs(offsetB)
     sink.play()
     var p = (q + rate * 40 / 1000).toInt()
+    var lastPos = sink.getCurrentPositionUs(false)
     repeat(80) {
       sink.handleBuffer(pcm16(b, p, block), offsetB + p * 1_000_000L / rate, 1)
       p += block
+      val pos = sink.getCurrentPositionUs(false)
+      if (pos != AudioSink.CURRENT_POSITION_NOT_SET) {
+        assertTrue("the clock went back: $lastPos -> $pos", pos >= lastPos - 1_000)
+        lastPos = pos
+      }
     }
+    // The player's clock is where B is heard, never on the old song.
+    val endUs = sink.getCurrentPositionUs(false) - offsetB
+    val heardEnd = (q + (out.written.size / 2 - handoverOut)) * 1_000_000L / rate - 200_000L
+    assertTrue("at the end the player is at ${endUs / 1000} ms, B is heard at ${heardEnd / 1000} ms", abs(endUs - heardEnd) < 30_000)
     assertEquals("not joined: ${engine.note}; $events", MixEngine.State.DONE, engine.state)
 
     // From the handover on, the output is B itself.

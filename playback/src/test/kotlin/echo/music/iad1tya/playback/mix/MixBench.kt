@@ -50,7 +50,7 @@ class MixBench {
     log("A analysis: %.2f bpm conf %.2f tailBar %s mixOut %s end %s; %s".format(ra.bpm, ra.confidence, ra.tailAnchorMs, ra.mixOutPointMs, ra.lastSoundMs, ra.phaseNote))
     log("B analysis: %.2f bpm conf %.2f headBar %s mixIn %s start %s; %s".format(rb.bpm, rb.confidence, rb.headAnchorMs, rb.mixInPointMs, rb.firstSoundMs, rb.phaseNote))
 
-    val easeMs = 8_000L
+    val easeMs = 4_000L
     val plan =
       AutomixPlanner.plan(
         track(ra, aMs),

@@ -61,8 +61,16 @@ class MixAudioSink(private val delegate: AudioSink, val engine: MixEngine) : For
   /** Continuous timeline of what is written to the real output. */
   private var outputUs = 0L
 
-  /** Output timeline -> player timeline: (output us, player us or null when unknown). */
+  /**
+   * Output timeline -> player timeline, one entry per write: (output us, player us, next song us,
+   * epoch). The next song's time is known for what the engine plays of it in sample-exact mode;
+   * after a handover (a new epoch) the not yet heard output is reported in the next song's time,
+   * so the player's clock moves to the next song at once and never runs on the old one's.
+   */
   private val segments = ArrayDeque<LongArray>()
+  private var epoch = 0L
+  /** Stream offset of the song playing since the last handover (the next one's). */
+  private var nextOffsetUs = 0L
 
   private var inHandover = false
   private var handoverStartedAt = 0L
@@ -111,6 +119,7 @@ class MixAudioSink(private val delegate: AudioSink, val engine: MixEngine) : For
 
   override fun setOutputStreamOffsetUs(outputStreamOffsetUs: Long) {
     streamOffsetUs = outputStreamOffsetUs
+    nextOffsetUs = outputStreamOffsetUs
     streamId++
     resampler = null
     if (!isMixFormat) super.setOutputStreamOffsetUs(outputStreamOffsetUs)
@@ -152,14 +161,19 @@ class MixAudioSink(private val delegate: AudioSink, val engine: MixEngine) : For
     val songFrame = firstSongUs * MIX_RATE / 1_000_000L
 
     var playerUs: Long? = firstSongUs + streamOffsetUs
+    // The next song's sample this output starts with, while the engine plays it sample-exact.
+    var nextSongUs: Long? = null
     val mixed =
       synchronized(engine) {
+        engine.incomingPositionFrame?.let { nextSongUs = it * 1_000_000L / MIX_RATE }
         when {
           !engine.isActive -> resampled
           streamId == outgoingStream && engine.state != MixEngine.State.HANDING_OVER ->
             engine.processOutgoing(resampled, n, songFrame)
           engine.state == MixEngine.State.HANDING_OVER -> {
             if (inHandover) endFiller("the player's audio arrived")
+            // Ours then the player's, from the next song's sample [nextSongUs] on, continuously.
+            playerUs = nextSongUs?.let { it + streamOffsetUs }
             val out = engine.processIncoming(resampled, n, songFrame)
             if (engine.state == MixEngine.State.DONE) onEvent?.invoke("handover: ${engine.note}")
             out
@@ -173,7 +187,7 @@ class MixAudioSink(private val delegate: AudioSink, val engine: MixEngine) : For
         }
       }
     if (mixed.isEmpty()) return true
-    writeOut(mixed, playerUs)
+    writeOut(mixed, playerUs, nextSongUs)
     pendingOut?.let {
       if (!super.handleBuffer(it, pendingPtsUs, 1)) return true
       pendingOut = null
@@ -190,6 +204,11 @@ class MixAudioSink(private val delegate: AudioSink, val engine: MixEngine) : For
       handoverExpected = false
       resampler = null
       lastInputEndUs = Long.MIN_VALUE
+      // What follows is the next song: a new stream (its offset may not even change) and a new
+      // epoch for the positions.
+      streamId++
+      epoch++
+      nextOffsetUs = streamOffsetUs
       synchronized(engine) { engine.startHandover() }
       startFiller()
       return
@@ -211,7 +230,8 @@ class MixAudioSink(private val delegate: AudioSink, val engine: MixEngine) : For
   }
 
   override fun pause() {
-    if (inHandover) return // the handover's seek pauses the player for a moment: keep sounding
+    // The handover's seek stops the renderer for a moment (even before its flush): keep sounding.
+    if (isMixFormat && (inHandover || handoverExpected)) return
     super.pause()
   }
 
@@ -221,8 +241,15 @@ class MixAudioSink(private val delegate: AudioSink, val engine: MixEngine) : For
     if (out == AudioSink.CURRENT_POSITION_NOT_SET) return out
     while (segments.size > 1 && segments[1][0] <= out) segments.removeFirst()
     val seg = segments.firstOrNull() ?: return AudioSink.CURRENT_POSITION_NOT_SET
-    if (seg[0] > out || seg[1] == UNKNOWN) return AudioSink.CURRENT_POSITION_NOT_SET
-    return seg[1] + (out - seg[0])
+    if (seg[0] > out) return AudioSink.CURRENT_POSITION_NOT_SET
+    val since = out - seg[0]
+    return when {
+      // Written in this epoch with the player's own time.
+      seg[3] == epoch && seg[1] != UNKNOWN -> seg[1] + since
+      // The next song's audio: in its time, once it is the one playing.
+      seg[2] != UNKNOWN && (seg[3] < epoch || seg[1] == UNKNOWN) -> nextOffsetUs + seg[2] + since
+      else -> AudioSink.CURRENT_POSITION_NOT_SET
+    }
   }
 
   override fun hasPendingData(): Boolean =
@@ -260,16 +287,16 @@ class MixAudioSink(private val delegate: AudioSink, val engine: MixEngine) : For
     inEncoding = C.ENCODING_INVALID
   }
 
-  /** Queues [x] (48 kHz stereo float) for the output; [playerUs] is its first frame's player time. */
-  private fun writeOut(x: FloatArray, playerUs: Long?) {
+  /**
+   * Queues [x] (48 kHz stereo float) for the output; [playerUs] is its first frame's player time,
+   * [nextSongUs] its time in the next song when it is the next song's audio.
+   */
+  private fun writeOut(x: FloatArray, playerUs: Long?, nextSongUs: Long? = null) {
     val frames = x.size / 2
     val buf = ByteBuffer.allocateDirect(frames * 4).order(ByteOrder.nativeOrder())
     for (v in x) buf.putShort((v.coerceIn(-1f, 1f) * 32767f).toInt().toShort())
     buf.flip()
-    val last = segments.lastOrNull()
-    val pu = playerUs ?: UNKNOWN
-    val continuous = last != null && last[1] != UNKNOWN && pu != UNKNOWN && abs(last[1] + (outputUs - last[0]) - pu) < 1_000
-    if (!continuous) segments.addLast(longArrayOf(outputUs, pu))
+    segments.addLast(longArrayOf(outputUs, playerUs ?: UNKNOWN, nextSongUs ?: UNKNOWN, epoch))
     pendingOut = buf
     pendingPtsUs = outputUs
     outputUs += frames * 1_000_000L / MIX_RATE
@@ -303,8 +330,13 @@ class MixAudioSink(private val delegate: AudioSink, val engine: MixEngine) : For
       val played = super.getCurrentPositionUs(false)
       val buffered = if (played == AudioSink.CURRENT_POSITION_NOT_SET) 0L else outputUs - played
       if (pendingOut == null && buffered < FILL_AHEAD_US) {
-        val chunk = synchronized(engine) { engine.fill(MIX_RATE / 100) }
-        writeOut(chunk, null)
+        var nextUs: Long? = null
+        val chunk =
+          synchronized(engine) {
+            nextUs = engine.incomingPositionFrame?.let { it * 1_000_000L / MIX_RATE }
+            engine.fill(MIX_RATE / 100)
+          }
+        writeOut(chunk, null, nextUs)
         if (super.handleBuffer(pendingOut!!, pendingPtsUs, 1)) pendingOut = null
       }
     } catch (e: Exception) {
