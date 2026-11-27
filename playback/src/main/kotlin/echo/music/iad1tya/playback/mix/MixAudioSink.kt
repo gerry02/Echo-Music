@@ -118,9 +118,12 @@ class MixAudioSink(private val delegate: AudioSink, val engine: MixEngine) : For
   }
 
   override fun setOutputStreamOffsetUs(outputStreamOffsetUs: Long) {
+    // ExoPlayer may tell the same offset again (the same song): only a new one is a new stream,
+    // or an armed mix would take its own song for the next one and drop itself.
+    val changed = outputStreamOffsetUs != streamOffsetUs
     streamOffsetUs = outputStreamOffsetUs
     nextOffsetUs = outputStreamOffsetUs
-    streamId++
+    if (changed) streamId++
     resampler = null
     if (!isMixFormat) super.setOutputStreamOffsetUs(outputStreamOffsetUs)
   }
@@ -183,7 +186,7 @@ class MixAudioSink(private val delegate: AudioSink, val engine: MixEngine) : For
           }
           else -> {
             // The outgoing song ended before the handover: the next one plays from where it is.
-            onEvent?.invoke("mix dropped: the song changed before the handover (${engine.note})")
+            onEvent?.invoke("mix dropped: another stream (${streamId} vs ${outgoingStream}) before the handover, state $state (${engine.note})")
             engine.reset()
             resampled
           }

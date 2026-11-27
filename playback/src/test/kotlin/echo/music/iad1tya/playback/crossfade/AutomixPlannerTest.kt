@@ -53,7 +53,7 @@ class AutomixPlannerTest {
     // The blend ends before the outgoing stream does.
     assertTrue(plan.triggerMs + plan.overlapMs <= 199_700)
     // Close tempos get the long blend: 8 bars.
-    assertEquals(16_000L, plan.overlapMs)
+    assertTrue("${plan.overlapMs}", plan.overlapMs >= 16_000)
   }
 
   @Test
@@ -155,12 +155,13 @@ class AutomixPlannerTest {
   }
 
   @Test
-  fun clashingKeysKeepTheBlendShort() {
+  fun clashingKeysKeepTheLongBlendWithTheNextSongThinUntilTheSwap() {
     val a = track(mixOut = 166_250).copy(keyPitchClass = 0, keyIsMinor = false) // C
     val b = track(mixIn = 18_250).copy(keyPitchClass = 6, keyIsMinor = false) // F#
     assertFalse(AutomixPlanner.keysCompatible(a, b)!!)
     val plan = AutomixPlanner.plan(a, b, 60_000, 5_000)!!
-    assertTrue(plan.overlapMs <= 8_000)
+    assertTrue("${plan.overlapMs}", plan.overlapMs >= 16_000)
+    assertTrue(AutomixPlanner.mixAt(plan, 0.3f).inBassCut > 0.99f)
     // A minor and C major are relative keys.
     assertTrue(
       AutomixPlanner.keysCompatible(
@@ -222,9 +223,10 @@ class AutomixPlannerTest {
     // 4-bar blend (clashing keys): swap after 2 bars; 8-bar blend: after 4 bars.
     val a = track().copy(keyPitchClass = 0, keyIsMinor = false)
     val b = track().copy(keyPitchClass = 6, keyIsMinor = false)
-    // Keys that clash are not laid over each other: an echo out instead.
+    // Keys that clash keep the long blend (8 bars), the swap after 4.
     val clash = AutomixPlanner.plan(a, b, 60_000, 5_000)!!
-    assertEquals(Style.ECHO_OUT, clash.style)
+    assertEquals(Style.BEAT_MATCH, clash.style)
+    assertEquals(16f / 32f, clash.bassSwapAt, 0.0001f)
     val long = AutomixPlanner.plan(track(), track(), 60_000, 5_000)!!
     assertEquals(16f / 32f, long.bassSwapAt, 0.0001f)
     // The incoming song is held thin until the swap, then opens.

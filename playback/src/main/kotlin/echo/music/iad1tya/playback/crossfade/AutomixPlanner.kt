@@ -154,14 +154,12 @@ object AutomixPlanner {
     val earliest = positionMs + 1_000
     if (beatSync && incoming != null && out.hasBeat && incoming.hasBeat) {
       val ratio = foldRatio(out.bpm / incoming.bpm)
-      val clash = keysCompatible(out, incoming) == false
-      // Close tempos and keys that go together: the long blend, the two songs laid over each other.
-      if (abs(ratio - 1f) <= MAX_TEMPO_CHANGE && !clash) {
+      // Close tempos: the long blend, the two songs laid over each other.
+      if (abs(ratio - 1f) <= MAX_TEMPO_CHANGE) {
         beatMatch(out, incoming, ratio, earliest, tailRoomMs)?.let { return it }
       }
-      // Laid over each other they would clash: an echo out, the next song dropped on the one.
-      echoOut(out, incoming, earliest, tailRoomMs, if (clash) "keys clash" else "tempos too far apart")
-        ?.let { return it }
+      // Tempos too far apart to lay one over the other: an echo out, the next song on the one.
+      echoOut(out, incoming, earliest, tailRoomMs, "tempos too far apart")?.let { return it }
     }
     return smooth(out, incoming, earliest, fadeMs, beatSync, tailRoomMs)
   }
@@ -234,7 +232,8 @@ object AutomixPlanner {
 
     // 8 bars when the tempo allows, 4 when the keys clash (two harmonies at once).
     var beats = if (32 * outPeriod <= MAX_BLEND_MS) 32 else 16
-    if (keysCompatible(out, incoming) == false) beats = minOf(beats, 16)
+    // Keys that clash keep the long blend: the incoming song stays thin (no bass, filtered) until
+    // the swap, so the harmonies barely meet, and a short blend sounded rushed.
     while (beats > MIN_BLEND_BEATS && beats * outPeriod > MAX_BLEND_MS) beats -= 4
 
     // A long outro holds a long blend: 16 bars from its start, the way a DJ rides an outro out.

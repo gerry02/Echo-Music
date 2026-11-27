@@ -5987,9 +5987,11 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
         if (state == echo.music.iad1tya.playback.mix.MixEngine.State.DONE) {
           // What was heard, not what was planned: how long both songs actually sounded together.
           val heardMs = engine.bothAudibleMs
-          val whole = heardMs >= plan.overlapMs / 2
+          // An echo out lays nothing over: its repeats ring over the next song by design.
+          val echo = plan.transition.style == AutomixPlanner.Style.ECHO_OUT
+          val whole = echo || heardMs >= plan.overlapMs / 2
           reportVerdict(
-            (if (!whole) "FALLBACK cut short: " else if (plan.isBeatMatch) "BEAT MATCH ok (one clock): " else "SMOOTH mix (one clock): ") +
+            (if (!whole) "FALLBACK cut short: " else if (echo) "ECHO OUT ok: " else if (plan.isBeatMatch) "BEAT MATCH ok (one clock): " else "SMOOTH mix (one clock): ") +
               "both songs heard together %.1f s of a %.1f s blend; ${engine.note}".format(heardMs / 1000.0, plan.overlapMs / 1000.0),
             when {
               !whole -> AutomixDebugInfo.VERDICT_FALLBACK
