@@ -181,6 +181,8 @@ object AutomixPlanner {
    * @param fadeMs the user's crossfade length, used by the smooth style.
    * @param beatSync whether a beat-matched blend may be planned: off, two songs with a beat get a
    *   filtered blend of at least [FILTERED_BLEND_MS] on the outgoing bar grid instead.
+   * @param tailRoomMs time the blend must end before the outgoing song does (the mix engine eases
+   *   the next song back to its own tempo and hands it over to the player there).
    */
   fun plan(
     out: Track,
@@ -188,15 +190,16 @@ object AutomixPlanner {
     positionMs: Long,
     fadeMs: Long,
     beatSync: Boolean = true,
+    tailRoomMs: Long = 0L,
   ): Plan? {
     val earliest = positionMs + 1_000
     if (beatSync && incoming != null && out.hasBeat && incoming.hasBeat) {
       val ratio = foldRatio(out.bpm / incoming.bpm)
       if (abs(ratio - 1f) <= MAX_TEMPO_CHANGE) {
-        beatMatch(out, incoming, ratio, earliest)?.let { return it }
+        beatMatch(out, incoming, ratio, earliest, tailRoomMs)?.let { return it }
       }
     }
-    return smooth(out, incoming, earliest, fadeMs, beatSync)
+    return smooth(out, incoming, earliest, fadeMs, beatSync, tailRoomMs)
   }
 
   /** Tempo ratio folded by octaves (a 70 BPM song against a 140 BPM one is a 1:1 match). */
@@ -249,13 +252,19 @@ object AutomixPlanner {
     return if (best != 0 && scores[best] >= scores[0] + 1.5f) best else null
   }
 
-  private fun beatMatch(out: Track, incoming: Track, speed: Float, earliest: Long): Plan? {
+  private fun beatMatch(
+    out: Track,
+    incoming: Track,
+    speed: Float,
+    earliest: Long,
+    tailRoomMs: Long = 0L,
+  ): Plan? {
     val outPeriod = out.periodMs
     val outBar = outPeriod * 4
     val inPeriod = incoming.periodMs
     val inBar = inPeriod * 4
     val audibleEnd = out.audibleEndMs
-    val hardEnd = (out.durationMs - END_MARGIN_MS).toDouble()
+    val hardEnd = (out.durationMs - END_MARGIN_MS - tailRoomMs).toDouble()
 
     val inFirstBar = snapUp((incoming.trustedFirstSoundMs ?: 0L).toDouble(), incoming.headBars, inBar)
 
@@ -311,12 +320,13 @@ object AutomixPlanner {
     earliest: Long,
     fadeMs: Long,
     beatSync: Boolean = true,
+    tailRoomMs: Long = 0L,
   ): Plan? {
     val bothBeat = incoming != null && out.hasBeat && incoming.hasBeat
     // Two songs with drums blend longer: the filters keep them from clashing while they overlap.
     val fade =
       (if (bothBeat) maxOf(fadeMs, FILTERED_BLEND_MS) else fadeMs).coerceIn(2_000L, 12_000L).toDouble()
-    val hardEnd = (out.durationMs - END_MARGIN_MS).toDouble()
+    val hardEnd = (out.durationMs - END_MARGIN_MS - tailRoomMs).toDouble()
     val audibleEnd = out.audibleEndMs
     var trigger =
       out.trustedMixOutMs?.toDouble()?.takeIf { it + fade <= audibleEnd }
