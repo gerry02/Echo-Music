@@ -57,7 +57,7 @@ class MixBench {
         track(rb, bMs),
         positionMs = 0,
         fadeMs = 8_000,
-        tailRoomMs = 1_000L,
+        tailRoomMs = 12_000L,
       ) ?: error("no plan")
     log(
       "plan: ${plan.reason}: mix at %.2f s for %.1f s, B from %.2f s at x%.4f, bass swap at %.2f"
@@ -66,11 +66,10 @@ class MixBench {
 
     val engine = MixEngine(rate)
     val bStart = plan.incomingStartMs * rate / 1000
-    // As the app does: the player moves to B 8 beats in; A's tail from its own decode.
+    // As the app does: the whole transition in the mixer (the stretch eased back over 16 beats),
+    // then the player moves to B at its own tempo.
     val beatMs = plan.overlapMs * plan.beatFraction
-    val handoverAfterMs = if (plan.style == AutomixPlanner.Style.BEAT_MATCH) (beatMs * 8).toLong() else plan.overlapMs / 4
-    val aFromMs = (plan.triggerMs + handoverAfterMs - 3_000).coerceAtLeast(0L)
-    engine.arm("a", "b", plan, arraySource(b, bStart), arraySource(a, aFromMs * rate / 1000), aFromMs, handoverAfterMs)
+    engine.arm("a", "b", plan, arraySource(b, bStart), null, 0, plan.overlapMs, easeMs = (beatMs * 16).toLong())
 
     // From 20 s before the mix: the outgoing song, block by block like a player.
     val from = ((plan.triggerMs - LEAD_MS) * rate / 1000).coerceAtLeast(0L).toInt()
@@ -83,7 +82,7 @@ class MixBench {
       f += n
     }
     check(engine.handoverDue) { "the handover never came: ${engine.note}" }
-    log("the player moves to B at A %.2f s, %d ms into the blend".format(f / rate.toDouble(), handoverAfterMs))
+    log("the player moves to B at A %.2f s (the blend ended at %.2f s)".format(f / rate.toDouble(), (plan.triggerMs + plan.overlapMs) / 1000.0))
 
     // The player is moved to B (at the stretch's speed): 150 ms to get there, landing [shiftMs] off.
     val switchOut = out.frames
@@ -103,14 +102,7 @@ class MixBench {
     // What is heard: from the switch the phone's output plays at the blend's stretch (the player's
     // speed), applied here the same way.
     val all = out.toArray()
-    val heard =
-      if (plan.incomingSpeed == 1f) all
-      else {
-        val pre = all.copyOfRange(0, (switchOut * 2).toInt())
-        val st = TimeStretcher(2, rate).apply { speed = plan.incomingSpeed.toDouble() }
-        val post = st.process(all, (switchOut * 2).toInt(), (out.frames - switchOut).toInt())
-        pre + post
-      }
+    val heard = all
     log("in the WAV: mix starts at %.1f s, blend ends at %.1f s".format(
       (plan.triggerMs * rate / 1000 - from) / rate.toDouble(),
       ((plan.triggerMs + plan.overlapMs) * rate / 1000 - from) / rate.toDouble(),

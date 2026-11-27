@@ -634,7 +634,7 @@ fun Lyrics(
     while (isActive) {
       val sliderPosition = sliderPositionProvider()
       isSeeking = sliderPosition != null
-      val pos = sliderPosition ?: playerConnection.player.currentPosition
+      val pos = sliderPosition ?: playerConnection.displayPosition
       val lyricsOffset = currentSong?.song?.lyricsOffset ?: 0
       val newIndex = findCurrentLineIndex(lines, pos + lyricsOffset)
       if (newIndex != currentLineIndex) {

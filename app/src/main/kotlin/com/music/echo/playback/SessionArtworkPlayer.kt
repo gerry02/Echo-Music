@@ -48,7 +48,34 @@ class SessionArtworkPlayer(
   private var lastSourceTimeline: Timeline? = null
   private var lastMappedTimeline: Timeline? = null
 
-  override fun getMediaMetadata(): MediaMetadata = sessionMetadata(super.getMediaMetadata())
+  override fun getMediaMetadata(): MediaMetadata =
+    sessionMetadata(MixDisplay.item?.mediaMetadata ?: super.getMediaMetadata())
+
+  // During a mix the session shows the next song (see [MixDisplay]): its position and length.
+  override fun getCurrentPosition(): Long = MixDisplay.item?.let { MixDisplay.positionMs() } ?: super.getCurrentPosition()
+
+  override fun getContentPosition(): Long = MixDisplay.item?.let { MixDisplay.positionMs() } ?: super.getContentPosition()
+
+  override fun getDuration(): Long =
+    MixDisplay.item?.mediaMetadata?.durationMs?.takeIf { it > 0 } ?: super.getDuration()
+
+  override fun getContentDuration(): Long =
+    MixDisplay.item?.mediaMetadata?.durationMs?.takeIf { it > 0 } ?: super.getContentDuration()
+
+  private val mixDisplayListener = {
+    android.os.Handler(android.os.Looper.getMainLooper()).post {
+      val metadata = getMediaMetadata()
+      listeners.keys.forEach { runCatching { it.onMediaMetadataChanged(metadata) } }
+    }
+    Unit
+  }
+
+  init {
+    MixDisplay.addListener(mixDisplayListener)
+  }
+
+  /** Stops following [MixDisplay] (the session moved to another player). */
+  fun detachMixDisplay() = MixDisplay.removeListener(mixDisplayListener)
 
   /**
    * ExoPlayer merges the item's metadata with the metadata inside the stream, and Media3 prefers

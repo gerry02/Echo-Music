@@ -40,6 +40,10 @@ class MixEngine(val rate: Int, val channels: Int = 2) {
     WAITING,
     /** The blend, the player on the outgoing song. */
     BLENDING,
+    /** The blend is over: the next song alone, its stretch easing back to its own tempo. */
+    EASING,
+    /** The next song at its own tempo, sample exact: time to move the player to it. */
+    READY,
     /** The player moved to the next song; its audio not joined yet. */
     SWITCHING,
     /** The blend, the player on the next song, the outgoing tail from our decode. */
@@ -60,6 +64,9 @@ class MixEngine(val rate: Int, val channels: Int = 2) {
   var incomingId: String? = null
     private set
 
+  private var earlyHandover = false
+  private var easeFrames = 0L
+  private var easedFrames = 0L
   private var triggerFrame = 0L
   private var blendFrames = 1L
   private var handoverAtFrame = 0L
@@ -102,7 +109,11 @@ class MixEngine(val rate: Int, val channels: Int = 2) {
     outgoing: PcmSource?,
     outgoingFromMs: Long,
     handoverAfterMs: Long,
+    easeMs: Long = 0L,
+    earlyHandover: Boolean = false,
   ) {
+    this.earlyHandover = earlyHandover && outgoing != null
+    easeFrames = if (plan.incomingSpeed == 1f) 0L else msToFrames(easeMs)
     reset()
     this.outgoingId = outgoingId
     this.incomingId = incomingId
@@ -130,6 +141,7 @@ class MixEngine(val rate: Int, val channels: Int = 2) {
     outSource = null
     outMatch = null
     outMatchGaveUp = false
+    easedFrames = 0L
     bothAudibleFrames = 0L
     playerA.clear()
     playerBufferFrames = 0
@@ -148,6 +160,8 @@ class MixEngine(val rate: Int, val channels: Int = 2) {
    */
   val handoverDue: Boolean
     get() {
+      if (!earlyHandover) return state == State.READY
+      if (state == State.READY) return true
       if (state != State.BLENDING || nextA < handoverAtFrame) return false
       if (progressAt(nextA.toDouble()) >= 1f) return true
       if (outMatch == null && !outMatchGaveUp) {
@@ -174,14 +188,29 @@ class MixEngine(val rate: Int, val channels: Int = 2) {
   val incomingPositionFrame: Long?
     get() =
       when (state) {
-        State.BLENDING -> inc.nominalPosition().toLong()
-        State.SWITCHING -> inc.exactPosition()
+        State.BLENDING, State.EASING -> inc.nominalPosition().toLong()
+        State.READY, State.SWITCHING -> inc.exactPosition()
         else -> null
       }
 
   /** Where the player should be sent: the next song's frame now (null before the blend). */
   val handoverFrame: Long?
-    get() = if (state == State.BLENDING) inc.nominalPosition().toLong() else null
+    get() =
+      when (state) {
+        State.BLENDING -> inc.nominalPosition().toLong()
+        State.READY -> inc.exactPosition()
+        else -> null
+      }
+
+  /** How far the blend is (0..1), for the screen to show the next song from halfway. */
+  val blendProgress: Float
+    get() =
+      when (state) {
+        State.WAITING -> 0f
+        State.BLENDING -> progressAt(nextA.toDouble())
+        State.IDLE -> 0f
+        else -> 1f
+      }
 
   /** The blend's stretch of the next song: the player's speed from the switch on. */
   val incomingSpeed: Double
@@ -211,6 +240,22 @@ class MixEngine(val rate: Int, val channels: Int = 2) {
           state = State.BLENDING
           note = "blend started at frame $t"
         }
+        if (state == State.BLENDING && progressAt(t.toDouble()) >= 1f && !earlyHandover) {
+          state = if (easeFrames > 0) State.EASING else State.READY
+          if (state == State.READY) inc.goRaw()
+        }
+        if (state == State.EASING) {
+          // The next song alone, its stretch easing back to its own tempo inside this mixer.
+          val u = (easedFrames.toDouble() / easeFrames).coerceIn(0.0, 1.0)
+          val sm = u * u * (3 - 2 * u)
+          inc.setSpeed(speed + (1.0 - speed) * sm)
+          easedFrames += n
+          if (u >= 1.0) {
+            inc.goRaw()
+            state = State.READY
+            note += "; eased to its own tempo"
+          }
+        }
         applyMix(p, progressAt(t.toDouble()))
         if (stripA.gain > AUDIBLE && stripB.gain > AUDIBLE) bothAudibleFrames += n
         stripA.processAdd(block, f * channels, result, f * channels, n)
@@ -228,7 +273,7 @@ class MixEngine(val rate: Int, val channels: Int = 2) {
    * raw. Called once, at the exact point the output's speed changes (or the flush, at speed 1).
    */
   fun switchToNext() {
-    if (state != State.BLENDING && state != State.WAITING) return
+    if (state != State.BLENDING && state != State.WAITING && state != State.READY) return
     if (state == State.WAITING) {
       note = "switched before the blend"
     }
@@ -479,6 +524,10 @@ class MixEngine(val rate: Int, val channels: Int = 2) {
     }
 
     fun exactPosition(): Long = (stretcher?.exactInputPosition ?: 0L) - pendingFrames
+
+    fun setSpeed(v: Double) {
+      stretcher?.speed = v
+    }
 
     /** From now on raw (speed 1, sample exact). */
     fun goRaw() {

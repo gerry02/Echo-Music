@@ -130,14 +130,16 @@ class MixEngineTest {
       } else noise(70.0, 2)
     val e = MixEngine(rate)
     val inStart = 6_000L
+    // The whole transition in the mixer: the blend, the stretch eased back (4 s), then the player.
     e.arm(
       "a",
       "b",
       plan(10_000, inStart, 8_000, speed, 16),
       source(b, inStart * rate / 1000),
-      source(a, 9L * rate),
-      9_000,
-      2_000,
+      null,
+      0,
+      8_000,
+      easeMs = 4_000,
     )
     // The outgoing song through the player until the handover is due.
     var f = 0
@@ -146,7 +148,7 @@ class MixEngineTest {
       val n = 1_152
       outs += e.processOutgoing(a.copyOfRange(f * 2, (f + n) * 2), n, f.toLong())
       f += n
-      assertTrue("handover never due: ${e.note}", f < rate * 15)
+      assertTrue("handover never due: ${e.note}", f < rate * 30)
     }
     val q0 = e.handoverFrame!!
     // A couple more outgoing buffers arrive before the switch reaches the output.
@@ -154,7 +156,6 @@ class MixEngineTest {
     f += 1_152
     e.switchToNext()
     assertEquals(MixEngine.State.SWITCHING, e.state)
-    assertTrue(e.note, e.note.contains("outgoing tail matched at offset 0"))
     // A late outgoing buffer after the switch: it stands for our decode, as many frames.
     assertEquals(1_152, e.processOutgoing(a.copyOfRange(f * 2, (f + 1_152) * 2), 1_152, f.toLong()).size / 2)
     // 120 ms for the player to get there.
@@ -178,7 +179,7 @@ class MixEngineTest {
     val passed = e.processIncoming(block, 1_024, p)
     assertTrue(passed.contentEquals(block))
     assertTrue(q0 > 0)
-    // Both songs were heard together for most of the 8 s blend, across the switch.
+    // Both songs were heard together for most of the 8 s blend.
     assertTrue("both heard ${e.bothAudibleMs} ms: ${e.note}", e.bothAudibleMs > 5_000)
     return e
   }

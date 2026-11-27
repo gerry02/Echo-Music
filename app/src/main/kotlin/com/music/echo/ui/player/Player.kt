@@ -325,7 +325,7 @@ fun BottomSheetPlayer(
   val mediaMetadata by playerConnection.mediaMetadata.collectAsState()
   val isEpisode =
     mediaMetadata?.let { metadata ->
-      val durationMs = maxOf(playerConnection.player.duration, metadata.duration * 1000L)
+      val durationMs = maxOf(playerConnection.displayDuration, metadata.duration * 1000L)
       PodcastProgress.get(metadata.id) != null ||
         PodcastProgress.isEpisode(metadata, durationMs) ||
         metadata.musicVideoType == MUSIC_VIDEO_TYPE_PODCAST_EPISODE ||
@@ -836,7 +836,7 @@ fun BottomSheetPlayer(
     try {
       val playerDurationSec =
         try {
-          playerConnection.player.duration.takeIf { it > 0 }?.div(1000L)
+          playerConnection.displayDuration.takeIf { it > 0 }?.div(1000L)
         } catch (e: Exception) {
           null
         }
@@ -988,7 +988,7 @@ fun BottomSheetPlayer(
       while (isActive) {
         sleepTimerTimeLeft =
           if (playerConnection.service.sleepTimer.pauseWhenSongEnd) {
-            playerConnection.player.duration - playerConnection.player.currentPosition
+            playerConnection.displayDuration - playerConnection.displayPosition
           } else {
             playerConnection.service.sleepTimer.triggerTime - System.currentTimeMillis()
           }
@@ -1094,11 +1094,11 @@ fun BottomSheetPlayer(
       while (isActive) {
         delay(200)
         if (sliderPosition == null) {
-          position = playerConnection.player.currentPosition
+          position = playerConnection.displayPosition
           duration =
             echo.music.iad1tya.playback.PlaybackCutoffGuard.computeEffectiveDuration(
               mediaMetadata?.duration,
-              playerConnection.player.duration,
+              playerConnection.displayDuration,
             )
         }
       }
@@ -1107,11 +1107,11 @@ fun BottomSheetPlayer(
 
   LaunchedEffect(playbackState, mediaMetadata?.id) {
     if (!isCasting) {
-      position = playerConnection.player.currentPosition
+      position = playerConnection.displayPosition
       duration =
         echo.music.iad1tya.playback.PlaybackCutoffGuard.computeEffectiveDuration(
           mediaMetadata?.duration,
-          playerConnection.player.duration,
+          playerConnection.displayDuration,
         )
     }
   }
@@ -2769,8 +2769,8 @@ fun BottomSheetPlayer(
               onSeek = { offsetMs ->
                 playerConnection.seekTo(
                   echo.music.iad1tya.playback.seekButtonTarget(
-                    if (isCasting) castPosition else playerConnection.player.currentPosition,
-                    if (isCasting) castDuration else playerConnection.player.duration,
+                    if (isCasting) castPosition else playerConnection.displayPosition,
+                    if (isCasting) castDuration else playerConnection.displayDuration,
                     offsetMs,
                   ),
                 )
@@ -2785,9 +2785,9 @@ fun BottomSheetPlayer(
               color = TextBackgroundColor,
               onSeek = { offsetMs ->
                 val currentPosition =
-                  if (isCasting) castPosition else playerConnection.player.currentPosition
+                  if (isCasting) castPosition else playerConnection.displayPosition
                 val currentDuration =
-                  if (isCasting) castDuration else playerConnection.player.duration
+                  if (isCasting) castDuration else playerConnection.displayDuration
                 playerConnection.seekTo(
                   echo.music.iad1tya.playback.seekButtonTarget(
                     currentPosition,
@@ -2805,9 +2805,9 @@ fun BottomSheetPlayer(
                 else playerConnection.player.isCurrentMediaItemSeekable)
             val seekBy: (Long) -> Unit = { offsetMs ->
               val currentPosition =
-                if (isCasting) castPosition else playerConnection.player.currentPosition
+                if (isCasting) castPosition else playerConnection.displayPosition
               val currentDuration =
-                if (isCasting) castDuration else playerConnection.player.duration
+                if (isCasting) castDuration else playerConnection.displayDuration
               playerConnection.seekTo(
                 echo.music.iad1tya.playback.seekButtonTarget(
                   currentPosition,

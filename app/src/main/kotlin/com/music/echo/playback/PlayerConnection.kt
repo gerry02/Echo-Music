@@ -132,6 +132,18 @@ class PlayerConnection(
       )
 
   val mediaMetadata = MutableStateFlow(player.currentMetadata)
+
+  /** The position the screen shows: during a mix, the next song's once it is shown (see MixDisplay). */
+  val displayPosition: Long
+    get() = MixDisplay.item?.let { MixDisplay.positionMs() } ?: player.currentPosition
+
+  /** The length the screen shows, likewise. */
+  val displayDuration: Long
+    get() =
+      MixDisplay.item?.let { item ->
+        item.mediaMetadata.durationMs?.takeIf { it > 0 }
+          ?: item.metadata?.duration?.takeIf { it > 0 }?.times(1000L)
+      } ?: player.duration
   val currentSong = mediaMetadata.flatMapLatest { database.song(it?.id) }
   val currentLyrics = mediaMetadata.flatMapLatest { mediaMetadata ->
     database.lyrics(mediaMetadata?.id)
