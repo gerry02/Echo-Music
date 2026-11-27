@@ -751,7 +751,20 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
    * Whether [mediaId] may use the addon at all: not while its host is pacing requests (a 429 made
    * the next songs fail too), and not for a song whose addon stream just failed.
    */
+  /**
+   * With the mix on, songs play from YouTube: the beat grid is measured on that encode, and the
+   * mixer decodes what the player plays, so both are the same audio (a lossless file is often
+   * another master, with its beats elsewhere). Songs that only exist on an addon still use it.
+   */
+  private fun mixWantsYouTube(mediaId: String): Boolean =
+    (automixEnabled || pendingMixKey != null) &&
+      !mediaId.startsWith("addon_") &&
+      !mediaId.startsWith("navidrome_") &&
+      !mediaId.startsWith("jellyfin_") &&
+      !mediaId.isLocalMediaId()
+
   private fun addonAllowedFor(mediaId: String): Boolean {
+    if (mixWantsYouTube(mediaId)) return false
     if (isRateLimitedRecently()) return false
     val until = addonFallbackUntil[mediaId] ?: return true
     if (until > System.currentTimeMillis()) return false
@@ -4796,6 +4809,7 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
           when {
             isDataSaver -> "data saver"
             !(preferExtensionAudio || lockedQuality.permitsAddons()) -> "quality $lockedQuality"
+            mixWantsYouTube(mediaId) -> "the mix is on for this source (it plays YouTube's encode)"
             isRateLimitedRecently() -> "host paced us (429/503) less than 2 min ago"
             addonFallbackUntil.containsKey(mediaId) -> "its addon stream failed recently"
             System.currentTimeMillis() - lastAddonStallAtMs < ADDON_STALL_COOLDOWN_MS ->
