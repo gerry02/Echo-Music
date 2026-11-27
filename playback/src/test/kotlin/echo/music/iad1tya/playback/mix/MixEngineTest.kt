@@ -178,7 +178,28 @@ class MixEngineTest {
     val passed = e.processIncoming(block, 1_024, p)
     assertTrue(passed.contentEquals(block))
     assertTrue(q0 > 0)
+    // Both songs were heard together for most of the 8 s blend, across the switch.
+    assertTrue("both heard ${e.bothAudibleMs} ms: ${e.note}", e.bothAudibleMs > 5_000)
     return e
+  }
+
+  @Test
+  fun withoutTheOutgoingDecodeThePlayerStaysOnItToTheEndOfTheBlend() {
+    // The outgoing song's own decode is missing (on the phone: its decode failed): no early
+    // handover, the whole blend plays on the player's outgoing song.
+    val a = noise(40.0, 1)
+    val b = noise(70.0, 2)
+    val e = MixEngine(rate)
+    e.arm("a", "b", plan(10_000, 6_000, 8_000, 1f, 16), source(b, 6L * rate), null, 9_000, 2_000)
+    var f = 0
+    while (!e.handoverDue) {
+      e.processOutgoing(a.copyOfRange(f * 2, (f + 1_152) * 2), 1_152, f.toLong())
+      f += 1_152
+      assertTrue("never due: ${e.note}", f < rate * 25)
+    }
+    // Due only once the blend is over (10 s + 8 s), all of it heard together.
+    assertTrue("due at ${f / rate.toDouble()} s", f >= rate * 18)
+    assertTrue("both heard ${e.bothAudibleMs} ms", e.bothAudibleMs > 5_000)
   }
 
   @Test

@@ -5962,6 +5962,7 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
     automixLog("mix armed: ${plan.transition.reason}, at ${plan.triggerTimeMs} ms, next from ${plan.incomingStartMs} ms, the player moves to it $handoverAfterMs ms in")
     val base = userPlaybackParameters()
     val stretch = plan.transition.incomingSpeed
+    var outgoingFailLogged = false
     try {
       // The engine mixes on its own; a few bars in, the player moves to the next song.
       while (true) {
@@ -5979,6 +5980,12 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
         }
         if (state == echo.music.iad1tya.playback.mix.MixEngine.State.BLENDING) {
           automixDebugInfo.value = automixDebugInfo.value?.copy(status = "mixing (one clock)")
+        }
+        outgoingDecoder.failed?.let { reason ->
+          if (!outgoingFailLogged) {
+            outgoingFailLogged = true
+            automixLog("mix: the outgoing song's own decode failed ($reason): the player stays on it to the end of the blend")
+          }
         }
         if (synchronized(engine) { engine.handoverDue }) break
         if (player.currentMediaItem?.mediaId != outgoingId) {
@@ -6005,10 +6012,17 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
       while (android.os.SystemClock.elapsedRealtime() < until) {
         val state = synchronized(engine) { engine.state }
         if (state == echo.music.iad1tya.playback.mix.MixEngine.State.DONE) {
+          // What was heard, not what was planned: how long both songs actually sounded together.
+          val heardMs = engine.bothAudibleMs
+          val whole = heardMs >= plan.overlapMs / 2
           reportVerdict(
-            if (plan.isBeatMatch) "BEAT MATCH ok (one clock): ${plan.overlapMs / 1000} s blend, ${engine.note}"
-            else "SMOOTH mix (one clock): ${plan.transition.reason.removePrefix("smooth: ")}",
-            if (plan.isBeatMatch) AutomixDebugInfo.VERDICT_BEAT_MATCH else AutomixDebugInfo.VERDICT_SMOOTH,
+            (if (!whole) "FALLBACK cut short: " else if (plan.isBeatMatch) "BEAT MATCH ok (one clock): " else "SMOOTH mix (one clock): ") +
+              "both songs heard together %.1f s of a %.1f s blend; ${engine.note}".format(heardMs / 1000.0, plan.overlapMs / 1000.0),
+            when {
+              !whole -> AutomixDebugInfo.VERDICT_FALLBACK
+              plan.isBeatMatch -> AutomixDebugInfo.VERDICT_BEAT_MATCH
+              else -> AutomixDebugInfo.VERDICT_SMOOTH
+            },
           )
           if (stretch != 1f) easeBackTempo(base, base.speed * stretch)
           return

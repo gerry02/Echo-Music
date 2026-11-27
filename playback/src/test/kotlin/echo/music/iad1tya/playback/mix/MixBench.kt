@@ -98,6 +98,7 @@ class MixBench {
       p += BLOCK
     }
     log("handover: ${engine.note}")
+    log("both songs heard together %.1f s of a %.1f s blend".format(engine.bothAudibleMs / 1000.0, plan.overlapMs / 1000.0))
     check(engine.state == MixEngine.State.DONE) { "the blend never finished: ${engine.note}" }
     // What is heard: from the switch the phone's output plays at the blend's stretch (the player's
     // speed), applied here the same way.

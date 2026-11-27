@@ -101,6 +101,13 @@ class IncomingDecoder(
       val format = extractor.getTrackFormat(track)
       val startUs = startMs * 1000
       extractor.seekTo(startUs, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
+      // A file without a seek index lands back at its start: walk the compressed samples, without
+      // decoding them, to just before the start (decoding the whole song first takes too long).
+      if (extractor.sampleTime in 0 until startUs - 3_000_000) {
+        while (extractor.sampleTime in 0 until startUs - 500_000) {
+          if (!extractor.advance() || stopped) break
+        }
+      }
       codec = MediaCodec.createDecoderByType(format.getString(MediaFormat.KEY_MIME)!!)
       if (Build.VERSION.SDK_INT >= 24) format.setInteger(MediaFormat.KEY_PCM_ENCODING, android.media.AudioFormat.ENCODING_PCM_FLOAT)
       codec.configure(format, null, null, 0)

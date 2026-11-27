@@ -128,6 +128,9 @@ class MixEngine(val rate: Int, val channels: Int = 2) {
     inc.clear()
     out.clear()
     outSource = null
+    outMatch = null
+    outMatchGaveUp = false
+    bothAudibleFrames = 0L
     playerA.clear()
     playerBufferFrames = 0
     matchOffset = null
@@ -137,9 +140,35 @@ class MixEngine(val rate: Int, val channels: Int = 2) {
   val isActive: Boolean
     get() = state != State.IDLE && state != State.DONE
 
-  /** Time to move the player to the next song: a few bars into the blend. */
+  /**
+   * Time to move the player to the next song: a few bars into the blend, once our own decode of
+   * the outgoing song is ready and matched to the player's (it carries the outgoing tail from
+   * then on). Without it the player stays on the outgoing song to the end of the blend: the screen
+   * changes later, but the blend is heard whole.
+   */
   val handoverDue: Boolean
-    get() = state == State.BLENDING && nextA >= handoverAtFrame
+    get() {
+      if (state != State.BLENDING || nextA < handoverAtFrame) return false
+      if (progressAt(nextA.toDouble()) >= 1f) return true
+      if (outMatch == null && !outMatchGaveUp) {
+        outMatch = out.matchOffset(playerA, nextA, channels)
+        if (outMatch == null && progressAt(nextA.toDouble()) > 0.5f) {
+          outMatchGaveUp = true
+          note += "; outgoing decode not ready or not matching: the player stays on it to the end of the blend"
+        }
+      }
+      return outMatch != null
+    }
+
+  private var outMatch: Pair<Long, Double>? = null
+  private var outMatchGaveUp = false
+
+  /** Output frames in which both songs were heard (each above -20 dB), for the log. */
+  var bothAudibleFrames = 0L
+    private set
+
+  val bothAudibleMs: Long
+    get() = bothAudibleFrames * 1000 / rate
 
   /** The next song's frame our next output sample is of (exact once it plays raw). */
   val incomingPositionFrame: Long?
@@ -183,6 +212,7 @@ class MixEngine(val rate: Int, val channels: Int = 2) {
           note = "blend started at frame $t"
         }
         applyMix(p, progressAt(t.toDouble()))
+        if (stripA.gain > AUDIBLE && stripB.gain > AUDIBLE) bothAudibleFrames += n
         stripA.processAdd(block, f * channels, result, f * channels, n)
         val b = inc.take(n, channels)
         stripB.processAdd(b, 0, result, f * channels, n)
@@ -202,9 +232,12 @@ class MixEngine(val rate: Int, val channels: Int = 2) {
     if (state == State.WAITING) {
       note = "switched before the blend"
     }
-    // Our decode of the outgoing song, matched to the player's last samples of it.
-    val d = out.matchOffset(playerA, nextA, channels)
-    if (d == null) {
+    // Our decode of the outgoing song, matched to the player's last samples of it (at the end of
+    // the blend it is no longer needed).
+    val d = if (progressAt(nextA.toDouble()) >= 1f) null else out.matchOffset(playerA, nextA, channels)
+    if (d == null && progressAt(nextA.toDouble()) >= 1f) {
+      out.disable()
+    } else if (d == null) {
       note += "; outgoing decode not matched, its tail fades out"
       out.disable()
     } else {
@@ -330,6 +363,7 @@ class MixEngine(val rate: Int, val channels: Int = 2) {
       applyMix(p, progress)
       stripB.processAdd(nextSong, f * channels, result, f * channels, n)
       if (progress < 1f && out.enabled) {
+        if (stripA.gain > AUDIBLE && stripB.gain > AUDIBLE) bothAudibleFrames += n
         val a = out.take(n, channels)
         stripA.processAdd(a, 0, result, f * channels, n)
       } else if (progress >= 1f) {
@@ -586,5 +620,7 @@ class MixEngine(val rate: Int, val channels: Int = 2) {
      */
     const val MIN_MATCH_SCORE = 0.8
     private const val WEAK_FADE_FRAMES = 14_400
+    /** A gain above this (-20 dB) counts as heard. */
+    private const val AUDIBLE = 0.1f
   }
 }
