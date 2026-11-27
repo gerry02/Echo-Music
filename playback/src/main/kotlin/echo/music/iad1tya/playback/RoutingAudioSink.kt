@@ -68,6 +68,33 @@ class RoutingAudioSink(
     usbSink.setListener(listener)
   }
 
+  // The interface's defaults do nothing: without these the sinks never learn, for one, the stream
+  // offset that turns buffer timestamps into song positions.
+  override fun setOutputStreamOffsetUs(outputStreamOffsetUs: Long) {
+    defaultSink.setOutputStreamOffsetUs(outputStreamOffsetUs)
+    usbSink.setOutputStreamOffsetUs(outputStreamOffsetUs)
+  }
+
+  override fun setPlayerId(playerId: androidx.media3.exoplayer.analytics.PlayerId?) {
+    defaultSink.setPlayerId(playerId)
+    usbSink.setPlayerId(playerId)
+  }
+
+  override fun setClock(clock: androidx.media3.common.util.Clock) {
+    defaultSink.setClock(clock)
+    usbSink.setClock(clock)
+  }
+
+  override fun setPreferredDevice(audioDeviceInfo: android.media.AudioDeviceInfo?) {
+    defaultSink.setPreferredDevice(audioDeviceInfo)
+    usbSink.setPreferredDevice(audioDeviceInfo)
+  }
+
+  override fun release() {
+    defaultSink.release()
+    usbSink.release()
+  }
+
   override fun supportsFormat(format: Format): Boolean = activeSink.supportsFormat(format)
 
   override fun getFormatSupport(format: Format): Int = activeSink.getFormatSupport(format)

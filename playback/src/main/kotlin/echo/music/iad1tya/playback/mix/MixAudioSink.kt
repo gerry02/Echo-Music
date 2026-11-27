@@ -54,6 +54,7 @@ class MixAudioSink(private val delegate: AudioSink, val engine: MixEngine) : For
   private var streamOffsetUs = 0L
   private var streamId = 0
   private var lastInputEndUs = Long.MIN_VALUE
+  private var offsetWarned = false
 
   private var pendingOut: ByteBuffer? = null
   private var pendingPtsUs = 0L
@@ -124,6 +125,14 @@ class MixAudioSink(private val delegate: AudioSink, val engine: MixEngine) : For
     }
     if (!buffer.hasRemaining()) return true
     val songUs = presentationTimeUs - streamOffsetUs
+    if (songUs > MAX_SONG_US && !offsetWarned) {
+      // No stream offset reached this sink: positions would be nonsense, so no mixing.
+      offsetWarned = true
+      onEvent?.invoke("mix sink: no stream offset (buffer at $presentationTimeUs us): mixing off")
+    }
+    if (songUs > MAX_SONG_US) {
+      synchronized(engine) { if (engine.isActive) engine.reset() }
+    }
     val frames = buffer.remaining() / (inChannels * bytesPerSample(inEncoding))
     val stereo = toStereoFloat(buffer, frames)
     buffer.position(buffer.limit())
@@ -173,6 +182,9 @@ class MixAudioSink(private val delegate: AudioSink, val engine: MixEngine) : For
   }
 
   override fun flush() {
+    // The handover's seek can flush more than once (the renderer is reset for the new song):
+    // every flush until the player's audio of the next song arrives belongs to it.
+    if (isMixFormat && inHandover) return
     if (isMixFormat && handoverExpected) {
       // The handover's seek: the output keeps playing the engine's audio meanwhile.
       handoverExpected = false
@@ -227,6 +239,8 @@ class MixAudioSink(private val delegate: AudioSink, val engine: MixEngine) : For
   }
 
   override fun reset() {
+    // The handover's seek may reset the renderer: the output keeps playing through it.
+    if (isMixFormat && (inHandover || handoverExpected)) return
     synchronized(engine) { engine.reset() }
     resetMixState()
     isMixFormat = false
@@ -335,6 +349,8 @@ class MixAudioSink(private val delegate: AudioSink, val engine: MixEngine) : For
     private const val UNKNOWN = Long.MIN_VALUE
     private const val FILL_AHEAD_US = 150_000L
     private const val MAX_FILL_MS = 3_000L
+    /** No song is a day long: a position past this means the stream offset is missing. */
+    private const val MAX_SONG_US = 86_400_000_000L
     val MIX_FORMAT: Format =
       Format.Builder()
         .setSampleMimeType(MimeTypes.AUDIO_RAW)
