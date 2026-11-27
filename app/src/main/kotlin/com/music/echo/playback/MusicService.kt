@@ -1461,12 +1461,37 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
     // Beat This! finds the beats and bars for the mix: loaded once, off the main thread.
     if (BeatAnalyzer.tracker == null) {
       scope.launch(Dispatchers.IO) {
+        // A native crash inside the model cannot be caught: it ends the process. Each run is
+        // marked, so a run that never finished turns the tracker off for this app version.
+        val guard = getSharedPreferences("automix_tracker", MODE_PRIVATE)
+        val version =
+          try {
+            androidx.core.content.pm.PackageInfoCompat.getLongVersionCode(packageManager.getPackageInfo(packageName, 0))
+          } catch (e: Exception) {
+            0L
+          }
+        if (guard.getBoolean("running", false)) {
+          guard.edit().putBoolean("running", false).putLong("disabledFor", version).commit()
+        }
+        if (guard.getLong("disabledFor", -1L) == version) {
+          automixLog("beat tracker: Beat This! off (it stopped the app last time), onset statistics instead")
+          return@launch
+        }
         try {
-          BeatAnalyzer.tracker =
+          val model =
             echo.music.iad1tya.playback.audio.BeatThisTracker(
               assets.open("beatthis/mel_spectrogram.onnx").use { it.readBytes() },
               assets.open("beatthis/beat_this_small.onnx").use { it.readBytes() },
             )
+          BeatAnalyzer.tracker =
+            echo.music.iad1tya.playback.audio.BeatTracker { pcm ->
+              guard.edit().putBoolean("running", true).commit()
+              try {
+                model.track(pcm)
+              } finally {
+                guard.edit().putBoolean("running", false).apply()
+              }
+            }
           automixLog("beat tracker: Beat This! loaded")
         } catch (e: Throwable) {
           automixLog("beat tracker: Beat This! not loaded (${e.message}), onset statistics instead")

@@ -8,7 +8,10 @@ plugins {
 android {
   namespace = "com.music.echo.playback"
   compileSdk = 37
-  defaultConfig { minSdk = 26 }
+  defaultConfig {
+    minSdk = 26
+    consumerProguardFiles("consumer-rules.pro")
+  }
   compileOptions {
     sourceCompatibility = JavaVersion.VERSION_21
     targetCompatibility = JavaVersion.VERSION_21
