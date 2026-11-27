@@ -185,20 +185,6 @@ class AutomixPlannerTest {
   }
 
   @Test
-  fun tempoReturnsSmoothlyAfterTheBlend() {
-    val plan = AutomixPlanner.plan(track(), track(bpm = 124f), 60_000, 5_000)!!
-    assertNotNull(plan)
-    assertEquals(plan.incomingSpeed, AutomixPlanner.restoreSpeedAt(plan, 0), 0.0001f)
-    assertEquals(1f, AutomixPlanner.restoreSpeedAt(plan, plan.restoreMs), 0.0001f)
-    var last = AutomixPlanner.restoreSpeedAt(plan, 0)
-    for (t in 0..plan.restoreMs step 250) {
-      val s = AutomixPlanner.restoreSpeedAt(plan, t)
-      assertTrue(abs(s - last) < 0.003f)
-      last = s
-    }
-  }
-
-  @Test
   fun sixMinuteSongNeverMixesOutMidSong() {
     // A file cut short at 3:02 once made the analysis think the song ended there.
     val out = track(durationMs = 360_000, mixOut = 180_250, lastSound = 182_000)
@@ -262,46 +248,6 @@ class AutomixPlannerTest {
       AutomixPlanner.plan(track(confidence = 0f), track(), 60_000, 5_000, beatSync = false)!!
     assertEquals(5_000L, ballad.overlapMs)
     assertFalse(ballad.filters)
-  }
-
-  @Test
-  fun phaseErrorWrapsToTheNearestBeat() {
-    val period = 60_000.0 / 140 // 428.6 ms
-    // The phone log: 391 ms behind is 37.6 ms ahead of the previous beat.
-    assertEquals(37.6, AutomixPlanner.wrapPhaseError(-391.0, period), 0.1)
-    assertEquals(-20.0, AutomixPlanner.wrapPhaseError(-20.0, period), 1e-9)
-    assertEquals(15.0, AutomixPlanner.wrapPhaseError(15.0 + 2 * period, period), 1e-6)
-    assertEquals(-100.0, AutomixPlanner.wrapPhaseError(period - 100.0, period), 1e-6)
-    // Never more than half a beat either way.
-    for (e in -2000..2000 step 7) {
-      val w = AutomixPlanner.wrapPhaseError(e.toDouble(), period)
-      assertTrue("$e -> $w", w > -period / 2 - 1e-9 && w <= period / 2 + 1e-9)
-    }
-  }
-
-  @Test
-  fun aBlendStillOffTheBeatWhenHeardFinishesFast() {
-    // Small offsets are fine; a big one is tolerated only while the next song is not heard yet.
-    assertFalse(AutomixPlanner.shouldBail(20.0, 0.5f))
-    assertFalse(AutomixPlanner.shouldBail(-150.0, 0.05f))
-    assertTrue(AutomixPlanner.shouldBail(-150.0, AutomixPlanner.PHASE_AUDIBLE_AT))
-    assertFalse(AutomixPlanner.shouldBail(45.0, 0.3f)) // the phone's 45 ms: nudged, not dropped
-    assertTrue(AutomixPlanner.shouldBail(75.0, 0.3f))
-    // The rest of the blend then takes at most BAIL_BLEND_MS.
-    assertEquals(0.3f, AutomixPlanner.bailProgress(0.3f, 0), 1e-6f)
-    assertEquals(0.55f, AutomixPlanner.bailProgress(0.3f, AutomixPlanner.BAIL_BLEND_MS / 4), 1e-4f)
-    assertEquals(1f, AutomixPlanner.bailProgress(0.3f, AutomixPlanner.BAIL_BLEND_MS), 0f)
-  }
-
-  @Test
-  fun theIncomingStartLeavesRoomForTheMutedPreRoll() {
-    // A next song whose intro starts right away: it starts on a later bar, still on its grid.
-    val next = track(mixIn = null, firstSound = 0)
-    val plan = AutomixPlanner.plan(track(), next, positionMs = 60_000, fadeMs = 5_000)!!
-    assertEquals(Style.BEAT_MATCH, plan.style)
-    assertTrue("starts at ${plan.incomingStartMs}", plan.incomingStartMs >= AutomixPlanner.PRE_ROLL_ROOM_MS)
-    assertTrue(plan.incomingStartMs < AutomixPlanner.PRE_ROLL_ROOM_MS + 2_000)
-    assertOnGrid(plan.incomingStartMs, 250.0, 2_000.0)
   }
 
   @Test

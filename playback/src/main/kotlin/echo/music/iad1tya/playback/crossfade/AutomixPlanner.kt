@@ -41,24 +41,6 @@ object AutomixPlanner {
   const val MAX_MIX_IN_MS = 45_000L
   private const val MAX_MIX_IN_SHARE = 0.2
 
-  /**
-   * Beat offset left between the two songs from which a beat-matched blend is not kept: below it a
-   * gentle nudge of speed still lines them up before it is noticed.
-   */
-  const val MAX_BLEND_PHASE_ERROR_MS = 70.0
-  /**
-   * Room left before the incoming start (its own ms) for the muted pre-roll that lines it up: a
-   * song started at its very first bar has none, so it starts a bar or two later instead.
-   */
-  const val PRE_ROLL_ROOM_MS = 6_500.0
-  /** Blend progress from which the incoming song is clearly heard: phase must be right by then. */
-  const val PHASE_AUDIBLE_AT = 0.12f
-  /**
-   * How long a blend that lost the beat takes to finish from where it is (0 -> 1): quicker than the
-   * planned blend, so two songs off the beat don't overlap for long, but still a smooth fade.
-   */
-  const val BAIL_BLEND_MS = 8_000L
-
   data class Track(
     val bpm: Float,
     val confidence: Float,
@@ -116,32 +98,6 @@ object AutomixPlanner {
       get() = firstSoundMs?.takeIf { it in 0..MAX_MIX_IN_MS }
   }
 
-  /**
-   * [errorMs] (incoming position minus where it should be) folded to the nearest beat, in
-   * (-period/2, period/2]: a song a whole beat late still lands its beats on the other's, and
-   * correcting the whole beat would play both songs against each other for seconds.
-   */
-  fun wrapPhaseError(errorMs: Double, periodMs: Double): Double {
-    if (periodMs <= 0 || !errorMs.isFinite()) return errorMs
-    var e = errorMs - Math.floor(errorMs / periodMs) * periodMs // [0, period)
-    if (e > periodMs / 2) e -= periodMs
-    return e
-  }
-
-  /**
-   * Whether a beat-matched blend at [progress] with the beats still [wrappedErrorMs] apart must give
-   * up the beat match: once the incoming song is heard, beats this far apart sound off-beat.
-   */
-  fun shouldBail(wrappedErrorMs: Double, progress: Float): Boolean =
-    progress >= PHASE_AUDIBLE_AT && abs(wrappedErrorMs) > MAX_BLEND_PHASE_ERROR_MS
-
-  /**
-   * Blend progress [msSinceBail] after a beat match gave up at [progressAtBail]: what is left of it
-   * plays out fast (at most [BAIL_BLEND_MS]), so two songs off the beat overlap only briefly.
-   */
-  fun bailProgress(progressAtBail: Float, msSinceBail: Long): Float =
-    (progressAtBail + msSinceBail.coerceAtLeast(0L).toFloat() / BAIL_BLEND_MS).coerceIn(0f, 1f)
-
   enum class Style {
     BEAT_MATCH,
     SMOOTH,
@@ -166,12 +122,7 @@ object AutomixPlanner {
     /** Whether the blend filters the songs (high-pass sweeps, bass swap). */
     val filters: Boolean = false,
     val reason: String = "",
-  ) {
-    /** One beat of the incoming song in its own position's ms (0 for a smooth crossfade). */
-    val incomingBeatMs: Double
-      get() =
-        if (style == Style.BEAT_MATCH) overlapMs.toDouble() * beatFraction * incomingSpeed else 0.0
-  }
+  )
 
   /** Length of the filtered blend between two songs with a beat that are not beat-synced. */
   const val FILTERED_BLEND_MS = 8_000L
@@ -289,12 +240,9 @@ object AutomixPlanner {
 
     val overlapMs = beats * outPeriod
     // The incoming body arrives as the blend ends: start its intro that many beats earlier.
-    var incomingStart =
+    val incomingStart =
       incoming.trustedMixInMs?.let { (it - beats * inPeriod).coerceAtLeast(inFirstBar) }
         ?.coerceAtMost(MAX_MIX_IN_MS.toDouble()) ?: inFirstBar
-    // Whole bars later when the pre-roll would have no room: the first bar or two play under the
-    // outgoing outro, thinned and quiet, so starting on a later downbeat loses nothing heard.
-    if (incomingStart < PRE_ROLL_ROOM_MS) incomingStart = snapUp(PRE_ROLL_ROOM_MS, incoming.headBars, inBar)
 
     // Swap the basslines on a phrase boundary near the middle: 4 bars into an 8-bar blend.
     val phrase = if (beats >= 32) 16 else if (beats >= 16) 8 else 4
@@ -431,15 +379,6 @@ object AutomixPlanner {
   }
 
   private fun smoothstep(t: Float): Float = t * t * (3 - 2 * t)
-
-  /** Incoming playback speed at [sinceBlendEndMs] after the blend, easing back to 1. */
-  fun restoreSpeedAt(plan: Plan, sinceBlendEndMs: Long): Float {
-    if (plan.restoreMs <= 0L || plan.incomingSpeed == 1f) return 1f
-    val t = ramp(sinceBlendEndMs.toFloat(), 0f, plan.restoreMs.toFloat())
-    // Smoothstep: no sudden change of tempo at either end.
-    val s = t * t * (3 - 2 * t)
-    return plan.incomingSpeed + (1f - plan.incomingSpeed) * s
-  }
 
   private fun ramp(x: Float, from: Float, to: Float): Float =
     if (to <= from) (if (x >= to) 1f else 0f) else ((x - from) / (to - from)).coerceIn(0f, 1f)
