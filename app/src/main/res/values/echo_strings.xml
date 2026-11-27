@@ -331,6 +331,11 @@
     <string name="automix_debug_desc">Show live beat analysis and transition plan on the player</string>
     <string name="mix_source">Mix</string>
     <string name="mix_source_settings_desc">DJ-style transitions, beat-matched when tempos are close. Turn it on per playlist, album or radio: on its page, or in the queue while it plays</string>
+    <string name="mix_ask_pick_best">Mix on. Also play next, among the coming songs, the one that mixes best (tempo and key)?</string>
+    <string name="mix_ask_pick_best_yes">Yes, pick the best</string>
+    <string name="mix_ask_pick_best_no">No, keep the order</string>
+    <string name="mix_pick_best_always">Always pick the best next song with the Mix</string>
+    <string name="mix_pick_best_always_desc">Turning the Mix on for a playlist, album or radio also turns this on, without asking</string>
     <string name="mix_source_desc">DJ-mix the songs of this playlist, album or radio, on the beat when their tempos are close</string>
     <string name="automix_pick_best_next">Pick the best next song</string>
     <string name="automix_pick_best_next_desc">With shuffle off, play next the one of the next 4 songs whose tempo and key mix best</string>

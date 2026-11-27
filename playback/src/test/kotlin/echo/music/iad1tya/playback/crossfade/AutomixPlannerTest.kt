@@ -177,10 +177,14 @@ class AutomixPlannerTest {
     assertEquals(1f, end.inGain, 0.001f)
     assertEquals(0f, end.inBassCut, 0.001f)
     assertEquals(1f, end.outBassCut, 0.001f)
+    // Band by band, never twice: one bassline at a time, the outgoing highs gone by the swap,
+    // and no hole in the level.
     for (i in 0..100) {
-      val m = AutomixPlanner.mixAt(plan, i / 100f)
-      val power = m.outGain * m.outGain + m.inGain * m.inGain
-      assertTrue("power $power at $i", power in 0.95f..1.001f)
+      val p = i / 100f
+      val m = AutomixPlanner.mixAt(plan, p)
+      assertTrue("both basslines at $p", m.outBassCut + m.inBassCut >= 0.99f)
+      assertTrue("level hole at $p", m.outGain + m.inGain >= 0.9f)
+      if (p >= plan.bassSwapAt) assertTrue("outgoing highs still there at $p", m.outLowPass >= 0.6f)
     }
   }
 

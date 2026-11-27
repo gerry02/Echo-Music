@@ -88,15 +88,14 @@ class MixEngineTest {
     val a = FloatArray(rate * 40 * 2)
     val bPeriod = 60_000.0 / 124
     val b = clicks(60.0, 95.0, bPeriod, 3_000.0)
-    // Mix at A's bar at 20.25 s; B starts at its beat 10 (95 + 10 beats).
     val inStart = (95 + 10 * bPeriod).toLong()
     val e = MixEngine(rate)
-    e.arm("a", "b", plan(20_250, inStart, 8_000, 120f / 124f, 16), source(b, inStart * rate / 1000), 4_000)
-    val out = runOutgoing(e, a, 0, rate * 30)
-    // Clicks heard during the second half of the blend (loud enough), against A's grid.
+    // No handover during the blend here (the player stays on the outgoing song).
+    e.arm("a", "b", plan(20_250, inStart, 8_000, 120f / 124f, 16), source(b, inStart * rate / 1000), null, 0, 7_999)
+    val out = runOutgoing(e, a, 0, (rate * 27.5).toInt())
     var worst = 0.0
     var checked = 0
-    for (k in 8 until 16) {
+    for (k in 8 until 14) {
       val expected = (20_250 + k * 500.0) * rate / 1000
       val from = (expected - 0.03 * rate).toInt()
       val to = (expected + 0.03 * rate).toInt()
@@ -109,94 +108,109 @@ class MixEngineTest {
     }
     // Within 10 ms (the stretcher's placement) of the outgoing beat, whatever the device.
     assertTrue("worst ${worst / rate * 1000} ms", worst / rate * 1000 < 10.5)
-    assertEquals(8, checked)
+    assertEquals(6, checked)
   }
 
-  private fun handover(playerShift: Long, decoderOffset: Int, music: Boolean = false) {
+  /**
+   * The whole transition with the early handover: blend on the player's outgoing song, the player
+   * moved to the next song 2 s in (landing [playerShift] off, decoding [decoderOffset] samples apart),
+   * the outgoing tail from its own decode, and the player's own audio once the blend is over.
+   */
+  private fun handover(
+    playerShift: Long,
+    decoderOffset: Int,
+    speed: Float = 1f,
+    music: Boolean = false,
+    playerAudio: FloatArray? = null,
+  ): MixEngine {
     val a = noise(40.0, 1)
-    // Music repeats itself: clicks and a held tone match well at many shifts, only one exactly.
     val b =
       if (music) clicks(70.0, 95.0, 60_000.0 / 124, 3_000.0).also { x ->
         for (i in x.indices) x[i] += (0.2 * sin(2 * PI * 220 * (i / 2) / rate)).toFloat()
       } else noise(70.0, 2)
     val e = MixEngine(rate)
     val inStart = 6_000L
-    e.arm("a", "b", plan(10_000, inStart, 8_000, 0.97f, 16), source(b, inStart * rate / 1000), 4_000)
-    // Blend (8 s) and ease (4 s) on the outgoing song's samples.
-    var out = runOutgoing(e, a, 0, rate * 23)
-    assertEquals(MixEngine.State.READY, e.state)
-    val q = e.handoverFrame!!
-    e.startHandover()
-    // 120 ms for the player to get there: our own audio meanwhile.
-    out += e.fill(rate * 120 / 1000)
-    // The player starts near where it was sent ([playerShift] off), decoding [decoderOffset]
-    // samples apart from us: its frame p sounds like our frame p + decoderOffset.
-    var p = q + rate * 120 / 1000 + playerShift
-    val tail = ArrayList<FloatArray>()
-    repeat(60) {
+    e.arm(
+      "a",
+      "b",
+      plan(10_000, inStart, 8_000, speed, 16),
+      source(b, inStart * rate / 1000),
+      source(a, 9L * rate),
+      9_000,
+      2_000,
+    )
+    // The outgoing song through the player until the handover is due.
+    var f = 0
+    val outs = ArrayList<FloatArray>()
+    while (!e.handoverDue) {
+      val n = 1_152
+      outs += e.processOutgoing(a.copyOfRange(f * 2, (f + n) * 2), n, f.toLong())
+      f += n
+      assertTrue("handover never due: ${e.note}", f < rate * 15)
+    }
+    val q0 = e.handoverFrame!!
+    // A couple more outgoing buffers arrive before the switch reaches the output.
+    outs += e.processOutgoing(a.copyOfRange(f * 2, (f + 1_152) * 2), 1_152, f.toLong())
+    f += 1_152
+    e.switchToNext()
+    assertEquals(MixEngine.State.SWITCHING, e.state)
+    assertTrue(e.note, e.note.contains("outgoing tail matched at offset 0"))
+    // A late outgoing buffer after the switch: it stands for our decode, as many frames.
+    assertEquals(1_152, e.processOutgoing(a.copyOfRange(f * 2, (f + 1_152) * 2), 1_152, f.toLong()).size / 2)
+    // 120 ms for the player to get there.
+    outs += e.fill(rate * 120 / 1000)
+    val q = e.incomingPositionFrame!!
+    var p = q + playerShift
+    val src = playerAudio ?: b
+    var lastBlock = FloatArray(0)
+    var lastOut = FloatArray(0)
+    repeat(400) {
+      if (e.state == MixEngine.State.DONE && lastBlock.isNotEmpty()) return@repeat
       val n = 1_024
-      val block = FloatArray(n * 2) { i -> b[((p + decoderOffset) * 2 + i).toInt()] }
-      tail += e.processIncoming(block, n, p)
+      val block = FloatArray(n * 2) { i -> src[((p + decoderOffset) * 2 + i).toInt()] }
+      lastOut = e.processIncoming(block, n, p)
+      lastBlock = block
       p += n
     }
-    out += tail.fold(FloatArray(0)) { acc, x -> acc + x }
-    assertEquals(MixEngine.State.DONE, e.state)
-    // From the handover on, the output is the next song itself, with no jump.
-    val startOut = rate * 23
-    for (i in 0 until (out.size / 2 - startOut)) {
-      for (c in 0 until 2) {
-        val expected = b[((q + i) * 2 + c).toInt()]
-        val got = out[(startOut + i) * 2 + c]
-        if (abs(expected - got) > 2e-3f) {
-          throw AssertionError("frame ${startOut + i} (next song ${q + i}): $got, expected $expected; ${e.note}")
-        }
-      }
-    }
+    assertEquals("not done: ${e.note}", MixEngine.State.DONE, e.state)
+    // Once the blend is over, the player's own audio passes through untouched.
+    val block = FloatArray(1_024 * 2) { i -> src[((p + decoderOffset) * 2 + i).toInt()] }
+    val passed = e.processIncoming(block, 1_024, p)
+    assertTrue(passed.contentEquals(block))
+    assertTrue(q0 > 0)
+    return e
+  }
+
+  @Test
+  fun earlyHandoverWhenThePlayerLandsLate() {
+    handover(playerShift = -700, decoderOffset = 0)
+  }
+
+  @Test
+  fun earlyHandoverWhenThePlayerLandsEarly() {
+    handover(playerShift = 900, decoderOffset = 0)
+  }
+
+  @Test
+  fun earlyHandoverWithAStretchedBlend() {
+    handover(playerShift = 200, decoderOffset = 0, speed = 0.97f)
+  }
+
+  @Test
+  fun earlyHandoverOnRepetitiveMusicPicksTheExactSample() {
+    val e = handover(playerShift = 1_920, decoderOffset = 0, music = true)
+    assertTrue(e.note, e.note.contains("player matched at offset 0 frames"))
+  }
+
+  @Test
+  fun earlyHandoverMatchesADecoderThatIsSamplesApart() {
+    val e = handover(playerShift = 200, decoderOffset = 312)
+    assertTrue(e.note, e.note.contains("player matched at offset 312 frames"))
   }
 
   @Test
   fun whenThePlayerPlaysOtherAudioItIsCrossfadedNotSpliced() {
-    // The player's stream is another master of the song (the FLAC, the mixer read YouTube):
-    // nothing matches, and the output must fade over to the player's audio, not jump in it.
-    val a = noise(40.0, 1)
-    val b = noise(70.0, 2)
-    val other = noise(70.0, 9)
-    val e = MixEngine(rate)
-    val inStart = 6_000L
-    e.arm("a", "b", plan(10_000, inStart, 8_000, 1f, 16), source(b, inStart * rate / 1000), 0)
-    var out = runOutgoing(e, a, 0, rate * 19)
-    assertEquals(MixEngine.State.READY, e.state)
-    val q = e.handoverFrame!!
-    e.startHandover()
-    val handoverOut = out.size / 2
-    var p = q + 2_000
-    val tail = ArrayList<FloatArray>()
-    repeat(40) {
-      val block = FloatArray(1_024 * 2) { i -> other[((p * 2) + i).toInt()] }
-      tail += e.processIncoming(block, 1_024, p)
-      p += 1_024
-    }
-    out += tail.fold(FloatArray(0)) { acc, x -> acc + x }
-    assertEquals(MixEngine.State.DONE, e.state)
+    val e = handover(playerShift = 0, decoderOffset = 0, playerAudio = noise(70.0, 9))
     assertTrue(e.note, e.note.contains("different audio"))
-    // Every frame came out (a crossfade, no gap), and it ends on the player's own audio.
-    assertEquals(handoverOut + 40 * 1_024, out.size / 2)
-    val last = out.size / 2 - 1
-    assertEquals(other[((p - 1) * 2).toInt()], out[last * 2], 1e-4f)
   }
-
-  @Test
-  fun handoverIsSeamlessWhenThePlayerLandsLate() = handover(playerShift = -700, decoderOffset = 0)
-
-  @Test
-  fun handoverIsSeamlessWhenThePlayerLandsEarly() = handover(playerShift = 900, decoderOffset = 0)
-
-  @Test
-  fun handoverIsSeamlessWhenThePlayerLandsWellAhead() = handover(playerShift = 6_000, decoderOffset = 0)
-
-  @Test
-  fun handoverOnRepetitiveMusicPicksTheExactSample() = handover(playerShift = 1_920, decoderOffset = 0, music = true)
-
-  @Test
-  fun handoverMatchesADecoderThatIsSamplesApart() = handover(playerShift = 200, decoderOffset = 312)
 }

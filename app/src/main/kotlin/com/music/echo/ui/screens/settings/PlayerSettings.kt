@@ -108,6 +108,8 @@ fun PlayerSettings(
     rememberPreference(CrossfadeDurationKey, defaultValue = 5f)
   val (automixDebugOverlay, onAutomixDebugOverlayChange) =
     rememberPreference(AutomixDebugOverlayKey, defaultValue = false)
+  val (mixPickBestAlways, onMixPickBestAlwaysChange) =
+    rememberPreference(echo.music.iad1tya.constants.AutomixPickBestNextKey, defaultValue = false)
   val (crossfadeGapless, onCrossfadeGaplessChange) =
     rememberPreference(CrossfadeGaplessKey, defaultValue = true)
   val (persistentQueue, onPersistentQueueChange) =
@@ -653,6 +655,29 @@ fun PlayerSettings(
               icon = painterResource(R.drawable.graphic_eq),
               title = { Text(stringResource(R.string.mix_source)) },
               description = { Text(stringResource(R.string.mix_source_settings_desc)) },
+            ),
+          )
+          add(
+            Material3SettingsItem(
+              isHighlighted = highlightKey == stringResource(R.string.mix_pick_best_always),
+              icon = painterResource(R.drawable.queue_music),
+              title = { Text(stringResource(R.string.mix_pick_best_always)) },
+              description = { Text(stringResource(R.string.mix_pick_best_always_desc)) },
+              trailingContent = {
+                Switch(
+                  checked = mixPickBestAlways,
+                  onCheckedChange = onMixPickBestAlwaysChange,
+                  thumbContent = {
+                    Icon(
+                      painter =
+                        painterResource(id = if (mixPickBestAlways) R.drawable.check else R.drawable.close),
+                      contentDescription = null,
+                      modifier = Modifier.size(SwitchDefaults.IconSize),
+                    )
+                  },
+                )
+              },
+              onClick = { onMixPickBestAlwaysChange(!mixPickBestAlways) },
             ),
           )
           add(

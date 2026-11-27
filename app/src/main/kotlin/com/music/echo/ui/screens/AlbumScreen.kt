@@ -428,7 +428,9 @@ fun AlbumScreen(
               Spacer(Modifier.height(24.dp))
 
               // DJ mix for this album, remembered.
-              echo.music.iad1tya.ui.component.MixSourceChip("album:${albumWithSongs.album.id}")
+              echo.music.iad1tya.ui.component.MixSourceChip("album:${albumWithSongs.album.id}") {
+                playerConnection.playQueue(LocalAlbumRadio(albumWithSongs))
+              }
               androidx.compose.foundation.layout.Spacer(Modifier.height(8.dp))
 
               Row(

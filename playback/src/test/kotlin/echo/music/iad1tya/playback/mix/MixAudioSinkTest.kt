@@ -143,19 +143,32 @@ class MixAudioSinkTest {
           return n
         }
       }
+    val outgoing =
+      object : PcmSource {
+        var pos = 9L * rate
+        override fun read(dst: FloatArray, maxFrames: Int): Int {
+          val n = minOf(maxFrames, (a.size / 2 - pos).toInt())
+          System.arraycopy(a, (pos * 2).toInt(), dst, 0, n * 2)
+          pos += n
+          return n
+        }
+      }
     synchronized(engine) {
-      engine.arm("a", "b", plan, source, 0)
+      // The player moves to B 2 s into the blend; A's tail from its own decode (from 9 s).
+      engine.arm("a", "b", plan, source, outgoing, 9_000, 2_000)
       mix.markOutgoingStream()
     }
     // Up to just before the trigger: still waiting, A untouched.
     feedA(rate * 10 - block)
     assertEquals("not mixing before its time: ${engine.note}", MixEngine.State.WAITING, engine.state)
-    // Through the blend.
-    feedA(rate * 18 + block)
-    assertEquals(MixEngine.State.READY, engine.state)
+    // Into the blend, until the handover is due.
+    while (!engine.handoverDue) {
+      feedA(f + block)
+      assertTrue("handover never due: ${engine.note}", f < rate * 15)
+    }
     // Still the outgoing song's time for the player.
     val beforeUs = sink.getCurrentPositionUs(false) - offsetA
-    assertTrue("before the handover the player is at A's ${beforeUs / 1000} ms", abs(beforeUs - 17_800_000L) < 100_000)
+    assertTrue("before the handover the player is at A's ${beforeUs / 1000} ms", abs(beforeUs - (f * 1_000_000L / rate - 200_000L)) < 30_000)
     val handoverOut = out.written.size / 2
     val q = engine.handoverFrame!!
 
@@ -165,20 +178,23 @@ class MixAudioSinkTest {
     sink.pause()
     sink.flush()
     sink.reset()
-    assertEquals("the handover cancelled itself: $events", MixEngine.State.HANDING_OVER, engine.state)
+    assertEquals("the handover cancelled itself: $events", MixEngine.State.SWITCHING, engine.state)
+    assertTrue(engine.note, engine.note.contains("outgoing tail matched at offset 0"))
     assertEquals("the real output was flushed during the handover", 0, out.flushes)
+    // The next song's sample the output continues with, exactly.
+    val qx = engine.incomingPositionFrame!!
     // From the handover on the player hears the next song: its clock is in B's time at once.
     val offsetB = if (sameOffset) offsetA else offsetA + 40_000_000L
     if (!sameOffset) sink.setOutputStreamOffsetUs(offsetB)
     val afterUs = sink.getCurrentPositionUs(false) - offsetB
     val heardB = q * 1_000_000L / rate - 200_000L
     assertTrue("right after the handover the player is at ${afterUs / 1000} ms, B is at ${heardB / 1000} ms", abs(afterUs - heardB) < 30_000)
-    // B, from where it was sent (40 ms off).
+    // B, from where it was sent (40 ms off), through the rest of the blend and after.
     sink.configure(format, 0, null)
     sink.play()
-    var p = (q + rate * 40 / 1000).toInt()
+    var p = (qx + rate * 40 / 1000).toInt()
     var lastPos = sink.getCurrentPositionUs(false)
-    repeat(80) {
+    repeat(400) {
       sink.handleBuffer(pcm16(b, p, block), offsetB + p * 1_000_000L / rate, 1)
       p += block
       val pos = sink.getCurrentPositionUs(false)
@@ -187,17 +203,16 @@ class MixAudioSinkTest {
         lastPos = pos
       }
     }
+    assertEquals("not done: ${engine.note}; $events", MixEngine.State.DONE, engine.state)
     // The player's clock is where B is heard, never on the old song.
     val endUs = sink.getCurrentPositionUs(false) - offsetB
-    val heardEnd = (q + (out.written.size / 2 - handoverOut)) * 1_000_000L / rate - 200_000L
+    val heardEnd = (qx + (out.written.size / 2 - handoverOut)) * 1_000_000L / rate - 200_000L
     assertTrue("at the end the player is at ${endUs / 1000} ms, B is heard at ${heardEnd / 1000} ms", abs(endUs - heardEnd) < 30_000)
-    assertEquals("not joined: ${engine.note}; $events", MixEngine.State.DONE, engine.state)
-
-    // From the handover on, the output is B itself.
+    // After the blend the output is B itself.
     val w = out.written
-    for (k in handoverOut until w.size / 2 - block) {
+    for (k in w.size / 2 - 4 * block until w.size / 2) {
       for (c in 0 until 2) {
-        val expected = (b[((q + (k - handoverOut)) * 2 + c).toInt()] * 32767).toInt()
+        val expected = (b[((qx + (k - handoverOut)) * 2 + c).toInt()] * 32767).toInt()
         assertTrue("frame $k: ${w[k * 2 + c]} vs $expected; ${engine.note}", abs(w[k * 2 + c] - expected) <= 3)
       }
     }

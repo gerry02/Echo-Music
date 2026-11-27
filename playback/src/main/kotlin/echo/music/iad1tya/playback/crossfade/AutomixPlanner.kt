@@ -24,6 +24,8 @@ object AutomixPlanner {
   const val MAX_TEMPO_CHANGE = 0.08f
   const val MIN_CONFIDENCE = 0.3f
   private const val MAX_BLEND_MS = 24_000.0
+  /** A long blend (16 bars) when the outgoing song's outro holds one. */
+  private const val MAX_LONG_BLEND_MS = 34_000.0
   private const val MIN_BLEND_BEATS = 8
   /** A blend never starts earlier than this before the end, nor in the first 3/4 of a short song. */
   const val MAX_MIX_LEAD_MS = 60_000L
@@ -224,6 +226,16 @@ object AutomixPlanner {
     if (keysCompatible(out, incoming) == false) beats = minOf(beats, 16)
     while (beats > MIN_BLEND_BEATS && beats * outPeriod > MAX_BLEND_MS) beats -= 4
 
+    // A long outro holds a long blend: 16 bars from its start, the way a DJ rides an outro out.
+    val mixOut = out.trustedMixOutMs?.toDouble()
+    if (
+      beats == 32 &&
+        64 * outPeriod <= MAX_LONG_BLEND_MS &&
+        mixOut != null &&
+        snapNearest(mixOut, out.tailBars, outBar) + 64 * outPeriod <= hardEnd
+    ) {
+      beats = 64
+    }
     // Start on the outro if there is one, else as late as a whole blend still fits; never
     // before the song's last minute.
     var trigger =
@@ -349,31 +361,25 @@ object AutomixPlanner {
         inHighPass = 0.5f * (1f - smoothstep(ramp(p, 0f, 0.6f))),
       )
     }
-    // Equal power, the incoming song a little ahead: it rises over the first 3/4 while the
-    // outgoing one falls over the last 3/4, the sum held at constant power.
-    var inGain = sin(PI / 2 * ramp(p, 0f, 0.75f)).toFloat()
-    var outGain = sin(PI / 2 * (1f - ramp(p, 0.25f, 1f))).toFloat()
-    val power = inGain * inGain + outGain * outGain
-    if (power > 1f) {
-      val k = 1f / sqrt(power)
-      inGain *= k
-      outGain *= k
-    }
-    // Bass swap over one bar from the phrase boundary: short enough that two basslines never
-    // muddy, long enough not to be heard as a cut.
+    // A DJ's hand-over, band by band, so no band ever sounds twice:
+    // - highs: the outgoing song's go (low-pass sweep) while the incoming one comes up, by the swap;
+    // - bass: one bassline at a time, swapped over one bar on the phrase boundary;
+    // - mids: the incoming song is thin (high-pass) until the swap, the outgoing one fades after it.
     val bar = 4 * plan.beatFraction
-    val swap = smoothstep(ramp(p, plan.bassSwapAt, plan.bassSwapAt + bar))
-    // The incoming song's low mids open gradually from halfway to the swap until its bass is in,
-    // like a DJ turning the low EQ up, instead of all at once.
-    val open = smoothstep(ramp(p, plan.bassSwapAt / 2, plan.bassSwapAt + bar))
+    val swapAt = plan.bassSwapAt
+    val swap = smoothstep(ramp(p, swapAt, swapAt + bar))
+    val open = smoothstep(ramp(p, swapAt / 2, swapAt + bar))
+    // The incoming song rises to full by the swap; the outgoing one holds, then fades out after it.
+    val inGain = sin(PI / 2 * ramp(p, 0f, swapAt)).toFloat()
+    val outGain = kotlin.math.cos(PI / 2 * (0.25f * ramp(p, 0f, swapAt) + 0.75f * ramp(p, swapAt, 1f))).toFloat()
+    // Its highs out by the swap (cutoff about 2 kHz), then the rest of the way.
+    val outLowPass = 0.65f * smoothstep(ramp(p, 0.1f * swapAt, swapAt)) + 0.35f * smoothstep(ramp(p, swapAt, 1f))
     return Mix(
       outGain = outGain,
       inGain = inGain,
       outBassCut = swap,
       inBassCut = 1f - swap,
-      // After the swap the outgoing song keeps no bass (shelf) and loses its highs (low-pass):
-      // what fades out last is its mids, which mask least.
-      outLowPass = smoothstep(ramp(p, plan.bassSwapAt, 1f)),
+      outLowPass = outLowPass,
       inHighPass = IN_HIGH_PASS * (1f - open),
     )
   }

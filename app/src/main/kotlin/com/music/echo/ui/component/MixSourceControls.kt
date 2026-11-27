@@ -5,6 +5,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.material3.FilterChip
@@ -16,6 +17,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.setValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -67,28 +69,75 @@ private fun setMix(
 }
 
 /**
- * "Mix" chip for a playlist, album or radio header: songs played from it are DJ-mixed into each
- * other (beat-matched when their tempos are close). Remembered per source; off by default.
+ * "Mix" button for a playlist, album or radio page, the same everywhere: songs played from it are
+ * DJ-mixed into each other (beat-matched when their tempos are close). Remembered per source; off
+ * by default. Turning it on asks whether to also pick the best-mixing next song (unless settings
+ * say always), then starts playing the source ([onPlay]) in mix mode.
  */
 @Composable
-fun MixSourceChip(sourceKey: String, modifier: Modifier = Modifier) {
+fun MixSourceChip(sourceKey: String, modifier: Modifier = Modifier, onPlay: (() -> Unit)? = null) {
   val playerConnection = LocalPlayerConnection.current
   val database = LocalDatabase.current
   val source = rememberMixSource(sourceKey)
   val on = source?.mix == true
-  FilterChip(
-    selected = on,
-    onClick = { setMix(playerConnection, database, sourceKey, source, mix = !on) },
-    label = { Text(stringResource(R.string.mix_source)) },
-    leadingIcon = {
-      Icon(
-        painter = painterResource(R.drawable.graphic_eq),
-        contentDescription = null,
-        modifier = Modifier.size(FilterChipDefaults.IconSize),
-      )
+  val alwaysPickBest by
+    echo.music.iad1tya.utils.rememberPreference(echo.music.iad1tya.constants.AutomixPickBestNextKey, false)
+  var asking by androidx.compose.runtime.remember { androidx.compose.runtime.mutableStateOf(false) }
+  fun turnOn(pickBest: Boolean) {
+    setMix(playerConnection, database, sourceKey, source, mix = true, pickBestNext = pickBest)
+    onPlay?.invoke()
+  }
+  androidx.compose.material3.FilledTonalButton(
+    onClick = {
+      when {
+        on -> setMix(playerConnection, database, sourceKey, source, mix = false)
+        alwaysPickBest -> turnOn(true)
+        else -> asking = true
+      }
     },
-    modifier = modifier,
-  )
+    colors =
+      if (on) {
+        androidx.compose.material3.ButtonDefaults.filledTonalButtonColors(
+          containerColor = MaterialTheme.colorScheme.primary,
+          contentColor = MaterialTheme.colorScheme.onPrimary,
+        )
+      } else {
+        androidx.compose.material3.ButtonDefaults.filledTonalButtonColors()
+      },
+    modifier = modifier.height(40.dp),
+  ) {
+    Icon(
+      painter = painterResource(if (on) R.drawable.check else R.drawable.graphic_eq),
+      contentDescription = null,
+      modifier = Modifier.size(18.dp),
+    )
+    Spacer(Modifier.size(8.dp))
+    Text(stringResource(R.string.mix_source), style = MaterialTheme.typography.labelLarge)
+  }
+  if (asking) {
+    androidx.compose.material3.AlertDialog(
+      onDismissRequest = { asking = false },
+      icon = { Icon(painterResource(R.drawable.graphic_eq), contentDescription = null) },
+      title = { Text(stringResource(R.string.mix_source)) },
+      text = { Text(stringResource(R.string.mix_ask_pick_best)) },
+      confirmButton = {
+        androidx.compose.material3.TextButton(
+          onClick = {
+            asking = false
+            turnOn(true)
+          }
+        ) { Text(stringResource(R.string.mix_ask_pick_best_yes)) }
+      },
+      dismissButton = {
+        androidx.compose.material3.TextButton(
+          onClick = {
+            asking = false
+            turnOn(false)
+          }
+        ) { Text(stringResource(R.string.mix_ask_pick_best_no)) }
+      },
+    )
+  }
 }
 
 /** The mix switches for the source playing now, for the queue sheet. */

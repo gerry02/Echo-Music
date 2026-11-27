@@ -270,10 +270,11 @@ object BeatAnalyzer {
         }
       }
 
+      // The start first: some files cannot seek back to their beginning once read further on.
+      val head = if (wantHead && durationUs > HEAD_WINDOW_US) window(0L, HEAD_WINDOW_US) else null
       val middle =
         if (wantMiddle) window(max(0L, durationUs / 2 - WINDOW_US / 2), WINDOW_US) else null
       if (wantMiddle && middle == null) return null
-      val head = if (wantHead && durationUs > HEAD_WINDOW_US) window(0L, HEAD_WINDOW_US) else null
       // Only a tail that reaches the real end tells where the song ends: in a file cut short the
       // data runs out mid-song, which would read as the song's last sound.
       val tail =

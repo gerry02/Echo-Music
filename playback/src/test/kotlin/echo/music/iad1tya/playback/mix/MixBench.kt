@@ -57,7 +57,7 @@ class MixBench {
         track(rb, bMs),
         positionMs = 0,
         fadeMs = 8_000,
-        tailRoomMs = easeMs + HANDOVER_ROOM_MS,
+        tailRoomMs = 1_000L,
       ) ?: error("no plan")
     log(
       "plan: ${plan.reason}: mix at %.2f s for %.1f s, B from %.2f s at x%.4f, bass swap at %.2f"
@@ -66,60 +66,56 @@ class MixBench {
 
     val engine = MixEngine(rate)
     val bStart = plan.incomingStartMs * rate / 1000
-    engine.arm("a", "b", plan, arraySource(b, bStart), easeMs)
+    // As the app does: the player moves to B 8 beats in; A's tail from its own decode.
+    val beatMs = plan.overlapMs * plan.beatFraction
+    val handoverAfterMs = if (plan.style == AutomixPlanner.Style.BEAT_MATCH) (beatMs * 8).toLong() else plan.overlapMs / 4
+    val aFromMs = (plan.triggerMs + handoverAfterMs - 3_000).coerceAtLeast(0L)
+    engine.arm("a", "b", plan, arraySource(b, bStart), arraySource(a, aFromMs * rate / 1000), aFromMs, handoverAfterMs)
 
     // From 20 s before the mix: the outgoing song, block by block like a player.
     val from = ((plan.triggerMs - LEAD_MS) * rate / 1000).coerceAtLeast(0L).toInt()
     val out = Pcm()
     var f = from
     val aFrames = a.size / 2
-    while (engine.state != MixEngine.State.READY && f < aFrames) {
+    while (!engine.handoverDue && f < aFrames) {
       val n = minOf(BLOCK, aFrames - f)
       out.add(engine.processOutgoing(a.copyOfRange(f * 2, (f + n) * 2), n, f.toLong()))
       f += n
     }
-    check(engine.state == MixEngine.State.READY) { "never ready to hand over: ${engine.note}" }
-    log("ready to hand over at A %.2f s (A ends at %.2f s)".format(f / rate.toDouble(), aMs / 1000.0))
+    check(engine.handoverDue) { "the handover never came: ${engine.note}" }
+    log("the player moves to B at A %.2f s, %d ms into the blend".format(f / rate.toDouble(), handoverAfterMs))
 
-    // The "player" is moved to B: 150 ms to get there, landing [shiftMs] off.
-    val q = engine.handoverFrame!!
-    val handoverOut = out.frames
-    engine.startHandover()
+    // The player is moved to B (at the stretch's speed): 150 ms to get there, landing [shiftMs] off.
+    val switchOut = out.frames
+    engine.switchToNext()
     val gap = rate * 150 / 1000
     out.add(engine.fill(gap))
-    var p = q + gap + shiftMs * rate / 1000
-    val endAt = out.frames + 20 * rate
+    var p = engine.incomingPositionFrame!! + shiftMs * rate / 1000
+    val endAt = out.frames + 40 * rate
     while (out.frames < endAt && p + BLOCK < b.size / 2) {
       val block = b.copyOfRange((p * 2).toInt(), ((p + BLOCK) * 2).toInt())
       out.add(if (engine.state == MixEngine.State.DONE) block else engine.processIncoming(block, BLOCK, p))
       p += BLOCK
     }
     log("handover: ${engine.note}")
-    // From the handover on the output must be B itself, sample for sample (ours, then the player's).
+    check(engine.state == MixEngine.State.DONE) { "the blend never finished: ${engine.note}" }
+    // What is heard: from the switch the phone's output plays at the blend's stretch (the player's
+    // speed), applied here the same way.
     val all = out.toArray()
-    var worst = 0f
-    var worstAt = -1L
-    for (k in handoverOut until out.frames) {
-      for (c in 0 until 2) {
-        val bi = ((q + (k - handoverOut)) * 2 + c).toInt()
-        if (bi >= b.size) break
-        val d = kotlin.math.abs(all[(k * 2 + c).toInt()] - b[bi])
-        if (d > worst) {
-          worst = d
-          worstAt = k
-        }
+    val heard =
+      if (plan.incomingSpeed == 1f) all
+      else {
+        val pre = all.copyOfRange(0, (switchOut * 2).toInt())
+        val st = TimeStretcher(2, rate).apply { speed = plan.incomingSpeed.toDouble() }
+        val post = st.process(all, (switchOut * 2).toInt(), (out.frames - switchOut).toInt())
+        pre + post
       }
-    }
-    log(
-      "handover check: largest difference from the next song itself %.5f at %.2f s of the WAV (%s)"
-        .format(worst, worstAt / rate.toDouble(), if (worst < 0.002f) "seamless" else "NOT seamless")
-    )
     log("in the WAV: mix starts at %.1f s, blend ends at %.1f s".format(
       (plan.triggerMs * rate / 1000 - from) / rate.toDouble(),
       ((plan.triggerMs + plan.overlapMs) * rate / 1000 - from) / rate.toDouble(),
     ))
 
-    writeWav(File(outPath), out.toArray())
+    writeWav(File(outPath), heard)
     File(outPath.removeSuffix(".wav") + ".txt").writeText(report.toString())
     log("written: $outPath")
   }

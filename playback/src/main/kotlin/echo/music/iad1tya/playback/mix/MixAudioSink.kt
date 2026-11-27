@@ -158,7 +158,8 @@ class MixAudioSink(private val delegate: AudioSink, val engine: MixEngine) : For
     val n = resampled.size / 2
     if (n == 0) return true
     val firstSongUs = resamplerBaseUs + firstOutFrame * 1_000_000L / MIX_RATE
-    val songFrame = firstSongUs * MIX_RATE / 1_000_000L
+    // Counted in frames from the resampler's start, so consecutive buffers are exactly contiguous.
+    val songFrame = resamplerBaseUs * MIX_RATE / 1_000_000L + firstOutFrame
 
     var playerUs: Long? = firstSongUs + streamOffsetUs
     // The next song's sample this output starts with, while the engine plays it sample-exact.
@@ -166,14 +167,16 @@ class MixAudioSink(private val delegate: AudioSink, val engine: MixEngine) : For
     val mixed =
       synchronized(engine) {
         engine.incomingPositionFrame?.let { nextSongUs = it * 1_000_000L / MIX_RATE }
+        val state = engine.state
         when {
           !engine.isActive -> resampled
-          streamId == outgoingStream && engine.state != MixEngine.State.HANDING_OVER ->
-            engine.processOutgoing(resampled, n, songFrame)
-          engine.state == MixEngine.State.HANDING_OVER -> {
+          // The outgoing song: before the switch it is mixed; the few buffers it still gives after
+          // the switch stand for frames of the engine's own decode of it.
+          streamId == outgoingStream -> engine.processOutgoing(resampled, n, songFrame)
+          state == MixEngine.State.SWITCHING || state == MixEngine.State.MIXING -> {
             if (inHandover) endFiller("the player's audio arrived")
             // Ours then the player's, from the next song's sample [nextSongUs] on, continuously.
-            playerUs = nextSongUs?.let { it + streamOffsetUs }
+            if (state == MixEngine.State.SWITCHING) playerUs = nextSongUs?.let { it + streamOffsetUs }
             val out = engine.processIncoming(resampled, n, songFrame)
             if (engine.state == MixEngine.State.DONE) onEvent?.invoke("handover: ${engine.note}")
             out
@@ -209,7 +212,8 @@ class MixAudioSink(private val delegate: AudioSink, val engine: MixEngine) : For
       streamId++
       epoch++
       nextOffsetUs = streamOffsetUs
-      synchronized(engine) { engine.startHandover() }
+      // At speed 1 the switch is here (otherwise it came with the speed change, just before).
+      synchronized(engine) { engine.switchToNext() }
       startFiller()
       return
     }
@@ -227,6 +231,13 @@ class MixAudioSink(private val delegate: AudioSink, val engine: MixEngine) : For
     lastInputEndUs = Long.MIN_VALUE
     segments.clear()
     super.flush()
+  }
+
+  override fun setPlaybackParameters(playbackParameters: androidx.media3.common.PlaybackParameters) {
+    // The handover sets the player's speed to the blend's stretch just before its seek: what is
+    // written from here on plays at it, so the engine switches here, sample exact.
+    if (isMixFormat && handoverExpected) synchronized(engine) { engine.switchToNext() }
+    super.setPlaybackParameters(playbackParameters)
   }
 
   override fun pause() {
