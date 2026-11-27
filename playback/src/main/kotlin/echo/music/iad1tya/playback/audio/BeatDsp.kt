@@ -350,6 +350,96 @@ object BeatDsp {
     return best
   }
 
+  /**
+   * The key of [pcm], from a chroma fine enough to tell semitones apart: the audio brought to about
+   * 11 kHz, 4096-point frames (2.7 Hz bins), only bins within 35 cents of a semitone between 80 Hz
+   * and 1.5 kHz counted. The onset spectrum's 1024-point bins are ~47 Hz wide: in the bass a bin
+   * spans several semitones and always fell on the same pitch classes, so every song came out in
+   * the same key. Null when no key stands out.
+   */
+  fun keyOf(pcm: MonoPcm): Pair<Int, Boolean>? {
+    val d = maxOf(1, pcm.sampleRate / 11_025)
+    val sr = pcm.sampleRate.toDouble() / d
+    val n = pcm.samples.size / d
+    if (n < KEY_FFT * 4) return null
+    val x = FloatArray(n) { i ->
+      var v = 0f
+      for (k in 0 until d) v += pcm.samples[i * d + k]
+      v / d
+    }
+    val window = FloatArray(KEY_FFT) { i -> (0.5 - 0.5 * kotlin.math.cos(2 * Math.PI * i / KEY_FFT)).toFloat() }
+    val pcOf = IntArray(KEY_FFT / 2) { -1 }
+    for (b in 1 until KEY_FFT / 2) {
+      val f = b * sr / KEY_FFT
+      if (f < 80 || f > 1_500) continue
+      val midi = 69.0 + 12.0 * (ln(f / 440.0) / ln(2.0))
+      val nearest = midi.roundToInt()
+      if (kotlin.math.abs(midi - nearest) * 100 > 35) continue
+      pcOf[b] = ((nearest % 12) + 12) % 12
+    }
+    // Each pitch class gets another number of bins (their spacing does not follow semitones):
+    // averaged per class, or the classes with more bins win for every song.
+    val count = IntArray(12)
+    for (pc in pcOf) if (pc >= 0) count[pc]++
+    if (count.any { it == 0 }) return null
+    val chroma = FloatArray(12)
+    val frame = FloatArray(12)
+    val re = FloatArray(KEY_FFT)
+    val im = FloatArray(KEY_FFT)
+    var off = 0
+    while (off + KEY_FFT <= n) {
+      for (i in 0 until KEY_FFT) {
+        re[i] = x[off + i] * window[i]
+        im[i] = 0f
+      }
+      fft(re, im)
+      frame.fill(0f)
+      for (b in 1 until KEY_FFT / 2) {
+        val pc = pcOf[b]
+        if (pc >= 0) frame[pc] += sqrt(re[b] * re[b] + im[b] * im[b])
+      }
+      // Per frame, so a loud passage does not outweigh the rest; compressed.
+      var total = 0f
+      for (pc in 0 until 12) {
+        frame[pc] /= count[pc]
+        total += frame[pc]
+      }
+      if (total > 0f) for (pc in 0 until 12) chroma[pc] += sqrt(frame[pc] / total)
+      off += KEY_FFT / 2
+    }
+    val sum = chroma.sum()
+    if (sum <= 0f) return null
+    val mean = sum / 12
+    for (i in chroma.indices) chroma[i] = chroma[i] / mean - 1f
+    var best = 0 to false
+    var bestScore = Float.NEGATIVE_INFINITY
+    var second = Float.NEGATIVE_INFINITY
+    for (tonic in 0 until 12) {
+      for (minor in listOf(false, true)) {
+        val score = correlate(chroma, if (minor) MINOR_PROFILE_CENTERED else MAJOR_PROFILE_CENTERED, tonic)
+        if (score > bestScore) {
+          second = bestScore
+          bestScore = score
+          best = tonic to minor
+        } else if (score > second) {
+          second = score
+        }
+      }
+    }
+    // A key that barely beats the next one (drums only, an atonal intro) is not a key.
+    return if (bestScore <= 0f || bestScore - second < 0.02f * bestScore) null else best
+  }
+
+  private val MAJOR_PROFILE_CENTERED by lazy { centered(MAJOR_PROFILE) }
+  private val MINOR_PROFILE_CENTERED by lazy { centered(MINOR_PROFILE) }
+
+  private fun centered(p: FloatArray): FloatArray {
+    val m = p.average().toFloat()
+    return FloatArray(p.size) { p[it] - m }
+  }
+
+  private const val KEY_FFT = 4096
+
   private fun correlate(chroma: FloatArray, profile: FloatArray, tonic: Int): Float {
     var sum = 0f
     for (degree in 0 until 12) sum += chroma[(degree + tonic) % 12] * profile[degree]

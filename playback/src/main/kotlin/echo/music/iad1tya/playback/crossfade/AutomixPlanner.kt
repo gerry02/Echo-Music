@@ -103,6 +103,12 @@ object AutomixPlanner {
   enum class Style {
     BEAT_MATCH,
     SMOOTH,
+    /**
+     * Two songs with a beat that would clash if laid over each other (keys apart, tempos too far):
+     * the outgoing song's last beat goes into a beat-synced echo while the incoming one drops in on
+     * the first beat of its bar; the repeats ring out over it. A DJ's echo out.
+     */
+    ECHO_OUT,
   }
 
   data class Plan(
@@ -148,9 +154,14 @@ object AutomixPlanner {
     val earliest = positionMs + 1_000
     if (beatSync && incoming != null && out.hasBeat && incoming.hasBeat) {
       val ratio = foldRatio(out.bpm / incoming.bpm)
-      if (abs(ratio - 1f) <= MAX_TEMPO_CHANGE) {
+      val clash = keysCompatible(out, incoming) == false
+      // Close tempos and keys that go together: the long blend, the two songs laid over each other.
+      if (abs(ratio - 1f) <= MAX_TEMPO_CHANGE && !clash) {
         beatMatch(out, incoming, ratio, earliest, tailRoomMs)?.let { return it }
       }
+      // Laid over each other they would clash: an echo out, the next song dropped on the one.
+      echoOut(out, incoming, earliest, tailRoomMs, if (clash) "keys clash" else "tempos too far apart")
+        ?.let { return it }
     }
     return smooth(out, incoming, earliest, fadeMs, beatSync, tailRoomMs)
   }
@@ -274,6 +285,37 @@ object AutomixPlanner {
     )
   }
 
+  private fun echoOut(out: Track, incoming: Track, earliest: Long, tailRoomMs: Long, why: String): Plan? {
+    val period = out.periodMs
+    val bar = period * 4
+    val hardEnd = (out.durationMs - END_MARGIN_MS - tailRoomMs).toDouble()
+    val audibleEnd = out.audibleEndMs
+    val beats = ECHO_BEATS
+    // The outro's first bar if there is one, else the last bar a whole echo still fits before.
+    var trigger =
+      out.trustedMixOutMs
+        ?.toDouble()
+        ?.let { snapNearest(it, out.tailBars, bar) }
+        ?.takeIf { it + beats * period <= hardEnd }
+        ?: snapDown(minOf(audibleEnd, hardEnd) - beats * period, out.tailBars, bar)
+    val floor = maxOf(earliest.toDouble(), out.earliestMixOutMs)
+    if (trigger < floor) trigger = snapUp(floor, out.tailBars, bar)
+    if (trigger + beats * period > hardEnd) return null
+    val inBar = incoming.periodMs * 4
+    val inFirstBar = snapUp((incoming.trustedFirstSoundMs ?: 0L).toDouble(), incoming.headBars, inBar)
+    return Plan(
+      style = Style.ECHO_OUT,
+      triggerMs = trigger.roundToLong(),
+      incomingStartMs = inFirstBar.roundToLong().coerceAtLeast(0L),
+      overlapMs = (beats * period).roundToLong(),
+      incomingSpeed = 1f,
+      bassSwapAt = 0f,
+      beatFraction = 1f / beats,
+      filters = true,
+      reason = "echo out: $why",
+    )
+  }
+
   private fun smooth(
     out: Track,
     incoming: Track?,
@@ -339,13 +381,30 @@ object AutomixPlanner {
     val outLowPass: Float = 0f,
     /** High-pass on the incoming song, 0 (open) .. 1 (thin). */
     val inHighPass: Float = 0f,
+    /** Echo send on the outgoing song (its repeats ring on after it): 0..1. */
+    val outEcho: Float = 0f,
   )
+
+  /** Length of an echo out, in outgoing beats (the repeats ring over the first two bars). */
+  private const val ECHO_BEATS = 8
 
   /** Incoming high-pass before the bass swap: about 200 Hz, its kick and bass held back. */
   private const val IN_HIGH_PASS = 0.6f
 
   fun mixAt(plan: Plan, progress: Float): Mix {
     val p = progress.coerceIn(0f, 1f)
+    if (plan.style == Style.ECHO_OUT) {
+      // The outgoing song's last beat into the echo, its dry sound gone within that beat, the
+      // incoming song up on the one; the repeats darken as they fade.
+      val beat = plan.beatFraction
+      val cut = smoothstep(ramp(p, 0f, beat * 0.75f))
+      return Mix(
+        outGain = 1f - cut,
+        inGain = smoothstep(ramp(p, 0f, beat * 0.5f)),
+        outEcho = if (p < beat) 1f else 0f,
+        outLowPass = 0.3f + 0.6f * smoothstep(ramp(p, 0f, 1f)),
+      )
+    }
     if (plan.style == Style.SMOOTH) {
       val g = EqualPowerCurve.calculateGains(p)
       if (!plan.filters) return Mix(g.outgoingGain, g.incomingGain)

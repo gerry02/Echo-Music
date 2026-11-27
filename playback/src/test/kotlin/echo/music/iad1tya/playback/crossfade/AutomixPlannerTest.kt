@@ -96,12 +96,20 @@ class AutomixPlannerTest {
   }
 
   @Test
-  fun farTemposFallBackToASmoothCrossfadeAtTheOutro() {
+  fun farTemposEchoOutAtTheOutroAndDropTheNextSongOnTheOne() {
     val plan = AutomixPlanner.plan(track(), track(bpm = 90f), positionMs = 60_000, fadeMs = 6_000)!!
-    assertEquals(Style.SMOOTH, plan.style)
+    assertEquals(Style.ECHO_OUT, plan.style)
     assertEquals(1f, plan.incomingSpeed)
     assertEquals(182_250L, plan.triggerMs)
-    assertEquals(AutomixPlanner.FILTERED_BLEND_MS, plan.overlapMs) // two beats: the long filtered blend
+    // 8 beats of repeats over the next song.
+    assertEquals(4_000L, plan.overlapMs)
+    val start = AutomixPlanner.mixAt(plan, 0f)
+    assertEquals(1f, start.outEcho, 0f)
+    // A beat in: the outgoing song's dry sound gone, the next one up, the repeats ringing on.
+    val later = AutomixPlanner.mixAt(plan, 0.2f)
+    assertEquals(0f, later.outGain, 0.001f)
+    assertEquals(1f, later.inGain, 0.001f)
+    assertEquals(0f, later.outEcho, 0f)
   }
 
   @Test
@@ -214,8 +222,9 @@ class AutomixPlannerTest {
     // 4-bar blend (clashing keys): swap after 2 bars; 8-bar blend: after 4 bars.
     val a = track().copy(keyPitchClass = 0, keyIsMinor = false)
     val b = track().copy(keyPitchClass = 6, keyIsMinor = false)
-    val short = AutomixPlanner.plan(a, b, 60_000, 5_000)!!
-    assertEquals(8f / 16f, short.bassSwapAt, 0.0001f)
+    // Keys that clash are not laid over each other: an echo out instead.
+    val clash = AutomixPlanner.plan(a, b, 60_000, 5_000)!!
+    assertEquals(Style.ECHO_OUT, clash.style)
     val long = AutomixPlanner.plan(track(), track(), 60_000, 5_000)!!
     assertEquals(16f / 32f, long.bassSwapAt, 0.0001f)
     // The incoming song is held thin until the swap, then opens.

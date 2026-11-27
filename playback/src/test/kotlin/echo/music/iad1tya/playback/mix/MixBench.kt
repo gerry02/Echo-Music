@@ -138,8 +138,8 @@ class MixBench {
       if ((r?.confidence ?: 0f) >= AutomixPlanner.MIN_CONFIDENCE) trackedSure++
       if ((d?.confidence ?: 0f) >= AutomixPlanner.MIN_CONFIDENCE) dspSure++
       val line =
-        "beat this %7.2f bpm conf %.2f | old %7.2f bpm conf %.2f | %s".format(
-          r?.bpm ?: 0f, r?.confidence ?: 0f, d?.bpm ?: 0f, d?.confidence ?: 0f, f.name,
+        "beat this %7.2f bpm conf %.2f key %-4s | old %7.2f bpm conf %.2f | %s".format(
+          r?.bpm ?: 0f, r?.confidence ?: 0f, keyName(r?.keyPitchClass, r?.keyIsMinor), d?.bpm ?: 0f, d?.confidence ?: 0f, f.name,
         )
       println(line)
       lines += line
@@ -150,6 +150,9 @@ class MixBench {
     out.appendText(summary + System.lineSeparator())
 
   }
+
+  private fun keyName(pc: Int?, minor: Boolean?): String =
+    pc?.let { listOf("C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B")[it] + if (minor == true) "m" else "" } ?: "-"
 
   private fun track(r: BeatAnalyzer.Result, durationMs: Long) =
     AutomixPlanner.Track(

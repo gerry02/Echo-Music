@@ -617,50 +617,57 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
   private val playerMixSinks = HashMap<Player, echo.music.iad1tya.playback.mix.MixAudioSink>()
 
   /**
-   * The source the queue plays from, for its mix setting: the queue's own key, or one for this
-   * queue only (in memory) when it has none.
+   * The mix is an action, like Play: the queue started with "Mix" plays mixed, for as long as it
+   * plays. Started normally, the same playlist or radio plays without it. Nothing is stored.
    */
-  private fun mixKeyOf(queue: Queue): String = queue.sourceKey ?: "session:${System.identityHashCode(queue)}"
+  private var mixQueue: Queue? = null
 
-  /** Mix settings of sources without a lasting key, for this session only. */
-  private val sessionMixSources = MutableStateFlow<Map<String, echo.music.iad1tya.db.entities.MixSourceEntity>>(emptyMap())
+  /** Mix pressed: the next queue to start is the mixed one ([startMixSession]). */
+  @Volatile private var mixStartPending: Boolean? = null
 
-  /** The mix setting of the source playing now. */
-  val currentMixSource = MutableStateFlow<echo.music.iad1tya.db.entities.MixSourceEntity?>(null)
+  /** Whether the queue playing now is mixed, and whether it picks the best next song. */
+  val mixOn = MutableStateFlow(false)
+  val mixPickBest = MutableStateFlow(false)
 
-  /** The key of the source playing now, for the queue sheet's mix switch. */
-  val currentMixKey: StateFlow<String>
-    get() = currentMixKeyState
-
-  private val currentMixKeyState = MutableStateFlow("session:0")
-
-  /** Turns the DJ mix on or off for the source [key] (a playlist, album, radio...). */
-  fun setMixSource(key: String, mix: Boolean? = null, pickBestNext: Boolean? = null) {
-    // Turned on from a page that starts playing it at once: its first song must already start in
-    // the mix format, before the stored setting comes back.
-    if (mix == true) {
-      pendingMixKey = key
-      playerMixSinks.values.forEach { it.mixMode = true }
-    } else if (mix == false && pendingMixKey == key) {
-      pendingMixKey = null
-    }
-    scope.launch(Dispatchers.IO) {
-      val old =
-        if (key.startsWith("session:")) sessionMixSources.value[key]
-        else database.mixSourceNow(key)
-      val new =
-        echo.music.iad1tya.db.entities.MixSourceEntity(
-          sourceKey = key,
-          mix = mix ?: old?.mix ?: false,
-          pickBestNext = pickBestNext ?: old?.pickBestNext ?: false,
-        )
-      if (key.startsWith("session:")) sessionMixSources.value = sessionMixSources.value + (key to new)
-      else database.query { upsert(new) }
-    }
+  /**
+   * "Mix" pressed on a playlist, album or radio: the queue about to start plays mixed, its first
+   * song already in the mix format. [pickBest] moves the best-mixing next song up.
+   */
+  fun startMixSession(pickBest: Boolean) {
+    mixStartPending = pickBest
+    playerMixSinks.values.forEach { it.mixMode = true }
   }
 
-  /** A source just turned on, until its stored setting is read back. */
-  @Volatile private var pendingMixKey: String? = null
+  /** The queue sheet's switches, for the queue playing now. */
+  fun setMixForCurrentQueue(on: Boolean) {
+    mixQueue = if (on) currentQueue else null
+    if (!on) mixPickBest.value = false
+    applyMixState()
+  }
+
+  fun setPickBestForCurrentQueue(on: Boolean) {
+    mixPickBest.value = on
+    applyMixState()
+  }
+
+  private fun applyMixState() {
+    val on = mixQueue != null && mixQueue === currentQueue
+    mixOn.value = on
+    automixPickBestNext = on && mixPickBest.value
+    playerMixSinks.values.forEach { it.mixMode = on || mixStartPending != null }
+    if (on == automixEnabled) return
+    automixEnabled = on
+    if (on) {
+      prepareAutomixForCurrentPair()
+      scheduleCrossfade()
+    } else {
+      crossfadeTriggerJob?.cancel()
+      crossfadeTriggerJob = null
+      activeAutomixPlan = null
+      automixDebugInfo.value = null
+      scheduleCrossfade()
+    }
+  }
 
   /** The next song being decoded for the mix running now. */
   private var mixDecoder: echo.music.iad1tya.playback.mix.IncomingDecoder? = null
@@ -757,7 +764,7 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
    * another master, with its beats elsewhere). Songs that only exist on an addon still use it.
    */
   private fun mixWantsYouTube(mediaId: String): Boolean =
-    (automixEnabled || pendingMixKey != null) &&
+    (automixEnabled || mixStartPending != null) &&
       !mediaId.startsWith("addon_") &&
       !mediaId.startsWith("navidrome_") &&
       !mediaId.startsWith("jellyfin_") &&
@@ -1526,38 +1533,17 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
       }
     }
 
-    // The mix is set per source (playlist, album, radio): follow the playing one's setting.
-    activeQueue
-      .map { mixKeyOf(it) }
-      .distinctUntilChanged()
-      .flatMapLatest { key ->
-        currentMixKeyState.value = key
-        if (key.startsWith("session:")) sessionMixSources.map { it[key] }
-        else database.mixSource(key)
-      }
-      .distinctUntilChanged()
-      .collect(scope) { source ->
-        currentMixSource.value = source
-        val key = currentMixKeyState.value
-        if (source?.mix == true && pendingMixKey == key) pendingMixKey = null
-        val on = source?.mix == true || pendingMixKey == key
-        automixPickBestNext = on && source?.pickBestNext == true
-        playerMixSinks.values.forEach { it.mixMode = on }
-        if (on == automixEnabled) return@collect
-        automixEnabled = on
-        val it = on
-        if (it) {
-          prepareAutomixForCurrentPair()
-          scheduleCrossfade()
-        } else {
-          crossfadeTriggerJob?.cancel()
-          crossfadeTriggerJob = null
-          activeAutomixPlan = null
-          automixDebugInfo.value = null
-          scheduleCrossfade()
+    // The mix follows the queue it was started with (see startMixSession).
+    activeQueue.collect(scope) { queue ->
+      mixStartPending?.let { pick ->
+        if (queue !is EmptyQueue) {
+          mixQueue = queue
+          mixPickBest.value = pick
+          mixStartPending = null
         }
       }
-
+      applyMixState()
+    }
 
     // Keep cached preferences in sync so Player.Listener callbacks can read
     // them without blocking the main thread.

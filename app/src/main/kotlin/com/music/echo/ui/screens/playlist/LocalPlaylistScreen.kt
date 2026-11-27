@@ -1242,7 +1242,7 @@ fun LocalPlaylistHeader(
     Spacer(modifier = Modifier.height(12.dp))
 
     // DJ mix for this playlist, remembered.
-    echo.music.iad1tya.ui.component.MixSourceChip("local-playlist:${playlist.playlist.id}") {
+    echo.music.iad1tya.ui.component.MixPlayButton {
       playerConnection.playQueue(
         ListQueue(
           title = playlist.playlist.name,

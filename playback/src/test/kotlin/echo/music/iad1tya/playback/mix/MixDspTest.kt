@@ -144,4 +144,26 @@ class MixDspTest {
     }
     assertTrue(first.isNotEmpty())
   }
+
+  @Test
+  fun theEchoRepeatsEveryDelayQuieterEachTime() {
+    val rate = 48_000
+    val strip = ChannelStrip(rate, 1).apply {
+      gain = 1f
+      echo = 1f
+      setEchoDelay(1_000, 0.5f)
+      snap()
+    }
+    val input = FloatArray(5_000)
+    input[0] = 1f
+    val out = FloatArray(5_000)
+    strip.processAdd(input, 0, out, 0, 1_000)
+    // From here the send is off: the repeats go on by themselves.
+    strip.echo = 0f
+    strip.processAdd(input, 1_000, out, 1_000, 4_000)
+    assertEquals(1f, out[0], 0.01f)
+    assertTrue("first repeat ${out[1_000]}", out[1_000] > 0.9f)
+    assertTrue("second repeat ${out[2_000]}", abs(out[2_000] - 0.5f * out[1_000]) < 0.1f)
+    assertTrue("third repeat ${out[3_000]}", out[3_000] < out[2_000] && out[3_000] > 0.1f)
+  }
 }

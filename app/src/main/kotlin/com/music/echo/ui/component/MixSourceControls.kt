@@ -8,131 +8,70 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.material3.FilterChip
-import androidx.compose.material3.FilterChipDefaults
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.setValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
-import echo.music.iad1tya.LocalDatabase
 import echo.music.iad1tya.LocalPlayerConnection
 import echo.music.iad1tya.R
-import echo.music.iad1tya.db.entities.MixSourceEntity
-import kotlinx.coroutines.flow.flowOf
-
-/** The mix setting of [sourceKey] as it is now, null when never set (mix off). */
-@Composable
-private fun rememberMixSource(sourceKey: String): MixSourceEntity? {
-  val playerConnection = LocalPlayerConnection.current
-  if (sourceKey.startsWith("session:")) {
-    // A queue of no lasting source: its setting lives in the player, for the queue playing now.
-    val current by (playerConnection?.service?.currentMixSource ?: kotlinx.coroutines.flow.MutableStateFlow<MixSourceEntity?>(null)).collectAsState()
-    return current?.takeIf { it.sourceKey == sourceKey }
-  }
-  val database = LocalDatabase.current
-  val flow = remember(sourceKey) { database.mixSource(sourceKey) }
-  val source by flow.collectAsState(initial = null)
-  return source
-}
-
-private fun setMix(
-  playerConnection: echo.music.iad1tya.playback.PlayerConnection?,
-  database: echo.music.iad1tya.db.MusicDatabase,
-  key: String,
-  old: MixSourceEntity?,
-  mix: Boolean? = null,
-  pickBestNext: Boolean? = null,
-) {
-  if (playerConnection != null) {
-    playerConnection.service.setMixSource(key, mix, pickBestNext)
-    return
-  }
-  database.query {
-    upsert(
-      MixSourceEntity(
-        sourceKey = key,
-        mix = mix ?: old?.mix ?: false,
-        pickBestNext = pickBestNext ?: old?.pickBestNext ?: false,
-      )
-    )
-  }
-}
+import echo.music.iad1tya.constants.AutomixPickBestNextKey
+import echo.music.iad1tya.utils.rememberPreference
 
 /**
- * "Mix" button for a playlist, album or radio page, the same everywhere: songs played from it are
- * DJ-mixed into each other (beat-matched when their tempos are close). Remembered per source; off
- * by default. Turning it on asks whether to also pick the best-mixing next song (unless settings
- * say always), then starts playing the source ([onPlay]) in mix mode.
+ * "Mix", an action like Play and Shuffle: starts the playlist, album or radio ([onPlay]) DJ-mixed,
+ * for this listening only. Asks first whether to also pick the best-mixing next song, unless the
+ * settings say always.
  */
 @Composable
-fun MixSourceChip(sourceKey: String, modifier: Modifier = Modifier, onPlay: (() -> Unit)? = null) {
-  val playerConnection = LocalPlayerConnection.current
-  val database = LocalDatabase.current
-  val source = rememberMixSource(sourceKey)
-  val on = source?.mix == true
-  val alwaysPickBest by
-    echo.music.iad1tya.utils.rememberPreference(echo.music.iad1tya.constants.AutomixPickBestNextKey, false)
-  var asking by androidx.compose.runtime.remember { androidx.compose.runtime.mutableStateOf(false) }
-  fun turnOn(pickBest: Boolean) {
-    setMix(playerConnection, database, sourceKey, source, mix = true, pickBestNext = pickBest)
-    onPlay?.invoke()
+fun MixPlayButton(modifier: Modifier = Modifier, onPlay: () -> Unit) {
+  val playerConnection = LocalPlayerConnection.current ?: return
+  val alwaysPickBest by rememberPreference(AutomixPickBestNextKey, false)
+  var asking by remember { mutableStateOf(false) }
+  fun start(pickBest: Boolean) {
+    playerConnection.service.startMixSession(pickBest)
+    onPlay()
   }
-  androidx.compose.material3.FilledTonalButton(
-    onClick = {
-      when {
-        on -> setMix(playerConnection, database, sourceKey, source, mix = false)
-        alwaysPickBest -> turnOn(true)
-        else -> asking = true
-      }
-    },
-    colors =
-      if (on) {
-        androidx.compose.material3.ButtonDefaults.filledTonalButtonColors(
-          containerColor = MaterialTheme.colorScheme.primary,
-          contentColor = MaterialTheme.colorScheme.onPrimary,
-        )
-      } else {
-        androidx.compose.material3.ButtonDefaults.filledTonalButtonColors()
-      },
-    modifier = modifier.height(40.dp),
+  FilledTonalButton(
+    onClick = { if (alwaysPickBest) start(true) else asking = true },
+    modifier = modifier.height(48.dp),
   ) {
-    Icon(
-      painter = painterResource(if (on) R.drawable.check else R.drawable.graphic_eq),
-      contentDescription = null,
-      modifier = Modifier.size(18.dp),
-    )
+    Icon(painterResource(R.drawable.graphic_eq), contentDescription = null, modifier = Modifier.size(20.dp))
     Spacer(Modifier.size(8.dp))
     Text(stringResource(R.string.mix_source), style = MaterialTheme.typography.labelLarge)
   }
   if (asking) {
-    androidx.compose.material3.AlertDialog(
+    AlertDialog(
       onDismissRequest = { asking = false },
       icon = { Icon(painterResource(R.drawable.graphic_eq), contentDescription = null) },
       title = { Text(stringResource(R.string.mix_source)) },
       text = { Text(stringResource(R.string.mix_ask_pick_best)) },
       confirmButton = {
-        androidx.compose.material3.TextButton(
+        TextButton(
           onClick = {
             asking = false
-            turnOn(true)
+            start(true)
           }
         ) { Text(stringResource(R.string.mix_ask_pick_best_yes)) }
       },
       dismissButton = {
-        androidx.compose.material3.TextButton(
+        TextButton(
           onClick = {
             asking = false
-            turnOn(false)
+            start(false)
           }
         ) { Text(stringResource(R.string.mix_ask_pick_best_no)) }
       },
@@ -140,13 +79,12 @@ fun MixSourceChip(sourceKey: String, modifier: Modifier = Modifier, onPlay: (() 
   }
 }
 
-/** The mix switches for the source playing now, for the queue sheet. */
+/** The mix switches for the queue playing now, in the queue sheet (for this listening only). */
 @Composable
-fun MixSourceSwitches(sourceKey: String, modifier: Modifier = Modifier) {
-  val playerConnection = LocalPlayerConnection.current
-  val database = LocalDatabase.current
-  val source = rememberMixSource(sourceKey)
-  val on = source?.mix == true
+fun MixQueueSwitches(modifier: Modifier = Modifier) {
+  val playerConnection = LocalPlayerConnection.current ?: return
+  val on by playerConnection.service.mixOn.collectAsState()
+  val pickBest by playerConnection.service.mixPickBest.collectAsState()
   Column(modifier = modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp)) {
     Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
       Icon(painter = painterResource(R.drawable.graphic_eq), contentDescription = null, modifier = Modifier.size(22.dp))
@@ -159,7 +97,7 @@ fun MixSourceSwitches(sourceKey: String, modifier: Modifier = Modifier) {
           color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
       }
-      Switch(checked = on, onCheckedChange = { setMix(playerConnection, database, sourceKey, source, mix = it) })
+      Switch(checked = on, onCheckedChange = { playerConnection.service.setMixForCurrentQueue(it) })
     }
     if (on) {
       Row(
@@ -176,10 +114,7 @@ fun MixSourceSwitches(sourceKey: String, modifier: Modifier = Modifier) {
             color = MaterialTheme.colorScheme.onSurfaceVariant,
           )
         }
-        Switch(
-          checked = source?.pickBestNext == true,
-          onCheckedChange = { setMix(playerConnection, database, sourceKey, source, pickBestNext = it) },
-        )
+        Switch(checked = pickBest, onCheckedChange = { playerConnection.service.setPickBestForCurrentQueue(it) })
       }
     }
   }

@@ -126,6 +126,11 @@ class MixEngine(val rate: Int, val channels: Int = 2) {
     outSource = outgoing
     out.start(outgoing, msToFrames(outgoingFromMs), 1.0 / speed)
     stripA = ChannelStrip(rate, channels).apply { gain = 1f }
+    if (plan.style == AutomixPlanner.Style.ECHO_OUT) {
+      // Repeats every half beat of the outgoing song, each at 55 %.
+      val beatFrames = (blendFrames * plan.beatFraction).toInt()
+      stripA.setEchoDelay(beatFrames / 2, 0.55f)
+    }
     stripB = ChannelStrip(rate, channels)
     state = State.WAITING
     note = "armed: mix at frame $triggerFrame, next from frame ${inc.startFrame}, speed ${plan.incomingSpeed}"
@@ -390,6 +395,7 @@ class MixEngine(val rate: Int, val channels: Int = 2) {
     stripA.bassCut = mix.outBassCut
     stripA.highPass = mix.outHighPass
     stripA.lowPass = mix.outLowPass
+    stripA.echo = mix.outEcho
     stripB.gain = mix.inGain * (if (switched) 1f else nextLevel)
     stripB.bassCut = mix.inBassCut
     stripB.highPass = mix.inHighPass

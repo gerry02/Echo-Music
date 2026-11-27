@@ -970,8 +970,7 @@ fun Queue(
         }
 
         // The DJ mix for the source playing now (playlist, album, radio).
-        val mixKey by playerConnection.service.currentMixKey.collectAsState()
-        echo.music.iad1tya.ui.component.MixSourceSwitches(mixKey)
+        echo.music.iad1tya.ui.component.MixQueueSwitches()
 
         Row(
           horizontalArrangement = Arrangement.SpaceBetween,

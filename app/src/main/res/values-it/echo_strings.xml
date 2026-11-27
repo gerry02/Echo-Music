@@ -650,13 +650,13 @@
     <string name="home_community_desc">Mostra nella Home le playlist della community</string>
     <string name="home_mood_and_genres_desc">Mostra nella Home le scorciatoie per mood e generi</string>
     <string name="mix_source">Mix</string>
-    <string name="mix_source_settings_desc">Transizioni da DJ, a tempo quando i BPM sono vicini. Si attiva per playlist, album o radio: dalla sua pagina, o dalla coda mentre suona</string>
+    <string name="mix_source_settings_desc">Transizioni da DJ, a tempo quando i BPM sono vicini. Premi Mix su una playlist, un album o una radio per ascoltarla mixata; avviata normalmente suona senza mix</string>
     <string name="mix_ask_pick_best">Mix attivo. Vuoi anche che tra i prossimi brani suoni prima quello che si mixa meglio (tempo e tonalità)?</string>
     <string name="mix_ask_pick_best_yes">Sì, scegli il migliore</string>
     <string name="mix_ask_pick_best_no">No, mantieni l\'ordine</string>
     <string name="mix_pick_best_always">Scegli sempre il brano migliore con il Mix</string>
-    <string name="mix_pick_best_always_desc">Attivando il Mix su una playlist, un album o una radio si attiva anche questo, senza chiedere</string>
-    <string name="mix_source_desc">Mixa come un DJ i brani di questa playlist, album o radio, a tempo quando i BPM sono vicini</string>
+    <string name="mix_pick_best_always_desc">Premendo Mix si attiva anche questo, senza chiedere</string>
+    <string name="mix_source_desc">Mixa come un DJ i brani in riproduzione, a tempo quando i BPM sono vicini (solo per questo ascolto)</string>
     <string name="automix_pick_best_next">Scegli il brano successivo migliore</string>
     <string name="automix_pick_best_next_desc">Con lo shuffle spento, fa suonare prima quello tra i prossimi 4 brani con tempo e tonalità più adatti al mix</string>
 </resources>

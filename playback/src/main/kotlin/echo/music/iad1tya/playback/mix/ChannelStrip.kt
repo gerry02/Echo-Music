@@ -19,6 +19,25 @@ class ChannelStrip(private val sampleRate: Int, private val channels: Int) {
   var bassCut = 0f
   var highPass = 0f
   var lowPass = 0f
+  /**
+   * Echo send (0..1): the song, through its filters, fed into a beat-synced delay whose repeats go
+   * on (and fade) after the song's own gain is down: a DJ's echo out.
+   */
+  var echo = 0f
+  /** Delay between repeats, in frames (set with [setEchoDelay]). */
+  private var echoDelay = 0
+  private var echoBuffer = FloatArray(0)
+  private var echoPos = 0
+  private var curEcho = 0f
+
+  /** The echo's repeat time ([frames], e.g. half a beat) and how much each repeat keeps. */
+  fun setEchoDelay(frames: Int, feedback: Float = 0.5f) {
+    echoDelay = frames.coerceAtLeast(1)
+    echoFeedback = feedback
+    if (echoBuffer.size < echoDelay * channels) echoBuffer = FloatArray(echoDelay * channels)
+  }
+
+  private var echoFeedback = 0.5f
 
   private var curGain = 0f
   private var curBass = 0f
@@ -76,6 +95,7 @@ class ChannelStrip(private val sampleRate: Int, private val channels: Int) {
     curBass = bassCut
     curHp = highPass
     curLp = lowPass
+    curEcho = echo
     updateCoefficients()
     initialized = true
   }
@@ -91,6 +111,7 @@ class ChannelStrip(private val sampleRate: Int, private val channels: Int) {
       curBass += (bassCut - curBass) * ease
       curHp += (highPass - curHp) * ease
       curLp += (lowPass - curLp) * ease
+      curEcho += (echo - curEcho) * ease
       if (--countdown <= 0) {
         countdown = UPDATE_SAMPLES
         updateCoefficients()
@@ -124,8 +145,17 @@ class ChannelStrip(private val sampleRate: Int, private val channels: Int) {
           lpIc2[c] = 2 * v2 - lpIc2[c]
           v += (v2 - v) * lpWet
         }
-        dst[dstOffset + f * channels + c] += (v * curGain).toFloat()
+        var outV = (v * curGain).toFloat()
+        if (echoDelay > 0) {
+          // The repeats: what was sent a delay ago, fed back a little quieter each time, darker.
+          val k = echoPos * channels + c
+          val delayed = echoBuffer[k]
+          echoBuffer[k] = (v.toFloat() * curEcho + delayed * echoFeedback)
+          outV += delayed
+        }
+        dst[dstOffset + f * channels + c] += outV
       }
+      if (echoDelay > 0) echoPos = (echoPos + 1) % echoDelay
     }
   }
 

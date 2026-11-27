@@ -883,7 +883,7 @@ private fun OnlinePlaylistHeader(
 
         // DJ mix for this playlist, remembered.
         if (!playlist.isPodcast) {
-          echo.music.iad1tya.ui.component.MixSourceChip("yt-playlist:${playlist.id}") {
+          echo.music.iad1tya.ui.component.MixPlayButton {
             if (songs.isNotEmpty()) {
               playerConnection.playQueue(
                 YouTubePlaylistQueue(

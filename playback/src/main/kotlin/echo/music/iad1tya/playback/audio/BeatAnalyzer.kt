@@ -25,7 +25,7 @@ import timber.log.Timber
 object BeatAnalyzer {
 
   /** Bumped when the analysis changes so stored rows are redone once. */
-  const val VERSION = 5
+  const val VERSION = 6
 
   data class Result(
     val bpm: Float,
@@ -375,7 +375,7 @@ object BeatAnalyzer {
       val comb = BeatDsp.beatPhase(midSpectrum.flux, periodFrames) ?: return null
       midBeatMs = windows.middleStartMs + midSpectrum.frameToMs(comb.phaseFrames)
     }
-    val key = midSpectrum?.let { BeatDsp.key(it) }
+    val key = windows.middle?.let { BeatDsp.keyOf(it) }
 
     // Local beat grids where the mixes happen.
     fun local(spectrum: BeatDsp.Spectrum?, startMs: Long): LocalGrid? {
@@ -652,7 +652,7 @@ object BeatAnalyzer {
     val head = fits.firstOrNull { it.win.name == "head" }
     val tail = fits.firstOrNull { it.win.name == "tail" }
     val midBar = mid?.let { barAnchor(it) }
-    val key = windows.middle?.let { m -> BeatDsp.spectrum(m)?.let { BeatDsp.key(it) } }
+    val key = windows.middle?.let { BeatDsp.keyOf(it) }
     val note =
       "beat this: " +
         fits.joinToString(", ") { "%s %d beats %.0f%% on grid".format(it.win.name, it.win.beats.size, it.onGrid * 100) }
