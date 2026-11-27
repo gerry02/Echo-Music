@@ -13,6 +13,8 @@ class LocalAlbumRadio(
   private val albumWithSongs: AlbumWithSongs,
   private val startIndex: Int = 0,
 ) : Queue {
+  override val sourceKey: String? = "album:${albumWithSongs.album.id}"
+
   override val preloadItem: MediaMetadata? = null
 
   private lateinit var playlistId: String

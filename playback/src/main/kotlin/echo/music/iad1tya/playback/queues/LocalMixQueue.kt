@@ -15,6 +15,8 @@ class LocalMixQueue(
   private val playlistId: String,
   private val maxMixSize: Int = 500,
 ) : Queue {
+  override val sourceKey: String? = "local-playlist:$playlistId"
+
   override val preloadItem: MediaMetadata? = null
 
   override suspend fun getInitialStatus(): Queue.Status =

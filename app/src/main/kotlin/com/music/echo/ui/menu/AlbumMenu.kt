@@ -306,7 +306,11 @@ fun AlbumMenu(
                   onDismiss()
                   if (songs.isNotEmpty()) {
                     playerConnection.playQueue(
-                      ListQueue(title = album.album.title, items = songs.map(Song::toMediaItem)),
+                      ListQueue(
+                        title = album.album.title,
+                        items = songs.map(Song::toMediaItem),
+                        sourceKey = "album:${album.album.id}",
+                      ),
                     )
                   }
                 },
@@ -332,6 +336,7 @@ fun AlbumMenu(
                       ListQueue(
                         title = album.album.title,
                         items = songs.shuffled().map(Song::toMediaItem),
+                        sourceKey = "album:${album.album.id}",
                       ),
                     )
                   }

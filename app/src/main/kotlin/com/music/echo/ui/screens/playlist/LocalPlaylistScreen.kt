@@ -665,6 +665,7 @@ fun LocalPlaylistScreen(
                         playerConnection.playQueue(
                           ListQueue(
                             title = playlist!!.playlist.name,
+                            sourceKey = "local-playlist:${playlist!!.playlist.id}",
                             items = songs.map { it.song.toMediaItem() },
                             startIndex = songs.indexOfFirst { it.map.id == song.map.id },
                           ),
@@ -1238,7 +1239,12 @@ fun LocalPlaylistHeader(
       color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.7f),
     )
 
-    Spacer(modifier = Modifier.height(24.dp))
+    Spacer(modifier = Modifier.height(12.dp))
+
+    // DJ mix for this playlist, remembered.
+    echo.music.iad1tya.ui.component.MixSourceChip("local-playlist:${playlist.playlist.id}")
+
+    Spacer(modifier = Modifier.height(12.dp))
 
     Row(
       modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp),
@@ -1250,6 +1256,7 @@ fun LocalPlaylistHeader(
           playerConnection.playQueue(
             ListQueue(
               title = playlist.playlist.name,
+              sourceKey = "local-playlist:${playlist.playlist.id}",
               items = songs.map { it.song.toMediaItem() },
             ),
           )
@@ -1280,6 +1287,7 @@ fun LocalPlaylistHeader(
           playerConnection.playQueue(
             ListQueue(
               title = playlist.playlist.name,
+              sourceKey = "local-playlist:${playlist.playlist.id}",
               items = songs.shuffled().map { it.song.toMediaItem() },
             ),
           )

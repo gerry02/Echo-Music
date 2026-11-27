@@ -360,6 +360,7 @@ fun PlaylistMenu(
                     playerConnection.playQueue(
                       ListQueue(
                         title = playlist.playlist.name,
+                        sourceKey = "local-playlist:${playlist.playlist.id}",
                         items = songs.map(Song::toMediaItem),
                       ),
                     )
@@ -382,6 +383,7 @@ fun PlaylistMenu(
                     playerConnection.playQueue(
                       ListQueue(
                         title = playlist.playlist.name,
+                        sourceKey = "local-playlist:${playlist.playlist.id}",
                         items = songs.shuffled().map(Song::toMediaItem),
                       ),
                     )

@@ -1718,6 +1718,14 @@ interface DatabaseDao {
 
   @Upsert fun upsert(beatInfo: BeatInfoEntity)
 
+  @Upsert fun upsert(mixSource: echo.music.iad1tya.db.entities.MixSourceEntity)
+
+  @Query("SELECT * FROM mix_source WHERE sourceKey = :sourceKey")
+  fun mixSource(sourceKey: String): kotlinx.coroutines.flow.Flow<echo.music.iad1tya.db.entities.MixSourceEntity?>
+
+  @Query("SELECT * FROM mix_source WHERE sourceKey = :sourceKey")
+  fun mixSourceNow(sourceKey: String): echo.music.iad1tya.db.entities.MixSourceEntity?
+
   @Query("SELECT * FROM beat_info WHERE songId = :songId")
   fun beatInfo(songId: String): BeatInfoEntity?
 

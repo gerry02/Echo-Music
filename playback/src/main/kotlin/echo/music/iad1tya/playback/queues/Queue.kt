@@ -8,6 +8,13 @@ import echo.music.iad1tya.models.MediaMetadata
 interface Queue {
   val preloadItem: MediaMetadata?
 
+  /**
+   * What this queue plays from, to remember settings for it (the DJ mix): "yt-playlist:<id>",
+   * "local-playlist:<id>", "album:<id>", "radio:<videoId>"... Null for a queue of no lasting source.
+   */
+  val sourceKey: String?
+    get() = null
+
   suspend fun getInitialStatus(): Status
 
   fun hasNextPage(): Boolean

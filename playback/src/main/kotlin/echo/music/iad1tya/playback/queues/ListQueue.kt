@@ -8,6 +8,7 @@ class ListQueue(
   val items: List<MediaItem>,
   val startIndex: Int = 0,
   val position: Long = 0L,
+  override val sourceKey: String? = null,
 ) : Queue {
   override val preloadItem: MediaMetadata? = null
 

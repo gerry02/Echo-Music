@@ -11,6 +11,8 @@ import kotlinx.coroutines.withContext
 class YouTubeAlbumRadio(
   private var playlistId: String,
 ) : Queue {
+  override val sourceKey: String? = "yt-album:$playlistId"
+
   override val preloadItem: MediaMetadata? = null
 
   private val endpoint: WatchEndpoint

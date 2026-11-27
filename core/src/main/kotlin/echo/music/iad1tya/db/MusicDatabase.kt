@@ -106,6 +106,7 @@ class MusicDatabase(
       RecognitionHistory::class,
       SpeedDialItem::class,
       BeatInfoEntity::class,
+      echo.music.iad1tya.db.entities.MixSourceEntity::class,
       SongPlayStatsEntity::class,
       RecommendationExclusionEntity::class,
       TasteProfileEntity::class,
@@ -116,7 +117,7 @@ class MusicDatabase(
       SortedSongAlbumMap::class,
       PlaylistSongMapPreview::class,
     ],
-  version = 49,
+  version = 50,
   exportSchema = true,
   autoMigrations =
     [
@@ -156,6 +157,7 @@ class MusicDatabase(
       AutoMigration(from = 46, to = 47, spec = Migration46To47Spec::class),
       AutoMigration(from = 47, to = 48, spec = Migration47To48Spec::class),
       AutoMigration(from = 48, to = 49),
+      AutoMigration(from = 49, to = 50),
     ],
 )
 @TypeConverters(Converters::class)

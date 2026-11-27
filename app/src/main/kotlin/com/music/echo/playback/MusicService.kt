@@ -634,6 +634,52 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
 
   private val playerSilenceProcessors = HashMap<Player, SilenceDetectorAudioProcessor>()
   private val playerDuckProcessors = HashMap<Player, AutomixDuckAudioProcessor>()
+  /** The mix sink of the player being built (its renderers are made in ExoPlayer.Builder.build). */
+  private var lastBuiltMixSink: echo.music.iad1tya.playback.mix.MixAudioSink? = null
+
+  /** Each player's mix output (the one-clock mix engine sits in it). */
+  private val playerMixSinks = HashMap<Player, echo.music.iad1tya.playback.mix.MixAudioSink>()
+
+  /**
+   * The source the queue plays from, for its mix setting: the queue's own key, or one for this
+   * queue only (in memory) when it has none.
+   */
+  private fun mixKeyOf(queue: Queue): String = queue.sourceKey ?: "session:${System.identityHashCode(queue)}"
+
+  /** Mix settings of sources without a lasting key, for this session only. */
+  private val sessionMixSources = MutableStateFlow<Map<String, echo.music.iad1tya.db.entities.MixSourceEntity>>(emptyMap())
+
+  /** The mix setting of the source playing now. */
+  val currentMixSource = MutableStateFlow<echo.music.iad1tya.db.entities.MixSourceEntity?>(null)
+
+  /** The key of the source playing now, for the queue sheet's mix switch. */
+  val currentMixKey: StateFlow<String>
+    get() = currentMixKeyState
+
+  private val currentMixKeyState = MutableStateFlow("session:0")
+
+  /** Turns the DJ mix on or off for the source [key] (a playlist, album, radio...). */
+  fun setMixSource(key: String, mix: Boolean? = null, pickBestNext: Boolean? = null) {
+    scope.launch(Dispatchers.IO) {
+      val old =
+        if (key.startsWith("session:")) sessionMixSources.value[key]
+        else database.mixSourceNow(key)
+      val new =
+        echo.music.iad1tya.db.entities.MixSourceEntity(
+          sourceKey = key,
+          mix = mix ?: old?.mix ?: false,
+          pickBestNext = pickBestNext ?: old?.pickBestNext ?: false,
+        )
+      if (key.startsWith("session:")) sessionMixSources.value = sessionMixSources.value + (key to new)
+      else database.query { upsert(new) }
+    }
+  }
+
+  /** The next song being decoded for the mix running now. */
+  private var mixDecoder: echo.music.iad1tya.playback.mix.IncomingDecoder? = null
+
+  /** The transition running on the mix engine, apart from the crossfade scheduler's job. */
+  private var mixJob: Job? = null
   private val playerStereoWideners = HashMap<Player, StereoWidenerAudioProcessor>()
   private val playerEqProcessors = HashMap<Player, CustomEqualizerAudioProcessor>()
   private val cutoffGuard = PlaybackCutoffGuard()
@@ -1436,17 +1482,24 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
       .distinctUntilChanged()
       .collect(scope) { YTPlayerUtils.forceOpusEnabled = it }
 
-    dataStore.data
-      .map {
-        (try {
-          it[AutomixCrossfadeKey]
-        } catch (e: Exception) {
-          null
-        }) ?: false
+    // The mix is set per source (playlist, album, radio): follow the playing one's setting.
+    activeQueue
+      .map { mixKeyOf(it) }
+      .distinctUntilChanged()
+      .flatMapLatest { key ->
+        currentMixKeyState.value = key
+        if (key.startsWith("session:")) sessionMixSources.map { it[key] }
+        else database.mixSource(key)
       }
       .distinctUntilChanged()
-      .collect(scope) {
-        automixEnabled = it
+      .collect(scope) { source ->
+        currentMixSource.value = source
+        val on = source?.mix == true
+        automixPickBestNext = on && source?.pickBestNext == true
+        playerMixSinks.values.forEach { it.mixMode = on }
+        if (on == automixEnabled) return@collect
+        automixEnabled = on
+        val it = on
         if (it) {
           prepareAutomixForCurrentPair()
           scheduleCrossfade()
@@ -1459,10 +1512,6 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
         }
       }
 
-    dataStore.data
-      .map { it[AutomixPickBestNextKey] ?: false }
-      .distinctUntilChanged()
-      .collect(scope) { automixPickBestNext = it }
 
     // Keep cached preferences in sync so Player.Listener callbacks can read
     // them without blocking the main thread.
@@ -2006,6 +2055,8 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
 
     playerSilenceProcessors[player] = silenceProcessor
     playerDuckProcessors[player] = duckProcessor
+    lastBuiltMixSink?.let { playerMixSinks[player] = it }
+    lastBuiltMixSink = null
     playerStereoWideners[player] = stereoWidener
     playerEqProcessors[player] = eqProcessor
 
@@ -5139,6 +5190,17 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
               )
               .build()
 
+          val mixSink =
+            echo.music.iad1tya.playback.mix.MixAudioSink(
+                defaultSink,
+                echo.music.iad1tya.playback.mix.MixEngine(echo.music.iad1tya.playback.mix.MixAudioSink.MIX_RATE),
+              )
+              .also {
+                it.mixMode = automixEnabled
+                it.onEvent = { event -> automixLog(event) }
+                lastBuiltMixSink = it
+              }
+
           val usbSink =
             UsbDacAudioSink(
               driver = usbAudioDriver,
@@ -5148,7 +5210,7 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
             )
 
           return AudioSinkSelector.createRoutingSink(
-            defaultAudioSink = defaultSink,
+            defaultAudioSink = mixSink,
             usbDacAudioSink = usbSink,
             isBitPerfectActive = {
               val dacConnected =
@@ -5706,7 +5768,7 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
   }
 
   private fun prepareAutomixForCurrentPair() {
-    if (!automixEnabled || !crossfadeEnabled || isCrossfading.value) return
+    if (!automixEnabled || isCrossfading.value) return
     val pair = currentAutomixPair() ?: return
     maybeAnalyzeBeat(pair.currentId, BeatAnalysisPriority.IMMEDIATE)
     if (pair.nextId != pair.currentId) {
@@ -5719,19 +5781,125 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
     return pair.currentId == plan.currentId && pair.nextId == plan.nextId
   }
 
+  /**
+   * One transition on the one-clock engine: decodes the next song ahead, arms the engine in this
+   * player's output (it mixes at the plan's sample by itself), then, once the blend is over and the
+   * next song plays at its own tempo, moves the player to the next song at the engine's sample:
+   * the output joins the player's audio there without a seam.
+   */
+  private suspend fun runMix(
+    plan: AutomixPlan,
+    sink: echo.music.iad1tya.playback.mix.MixAudioSink,
+    outgoingId: String?,
+  ) {
+    val engine = sink.engine
+    // Start decoding the next song well before the blend.
+    while (true) {
+      if (player.currentMediaItem?.mediaId != outgoingId || !isAutomixPlanCurrent(plan)) return
+      if (plan.triggerTimeMs - player.currentPosition <= MIX_DECODE_LEAD_MS) break
+      delay(250)
+    }
+    val nextIndex = player.nextMediaItemIndex
+    if (nextIndex == C.INDEX_UNSET || player.getMediaItemAt(nextIndex).mediaId != plan.nextId) return
+    if (plan.triggerTimeMs - player.currentPosition < 1_000) {
+      automixLog("mix: too late to arm (pos ${player.currentPosition}, mix at ${plan.triggerTimeMs})")
+      return
+    }
+    mixDecoder?.stop()
+    val decoder =
+      echo.music.iad1tya.playback.mix
+        .IncomingDecoder(
+          openSource = {
+            echo.music.iad1tya.playback.audio.StreamMediaDataSource(analysisDataSourceFactory, plan.nextId)
+          },
+          startMs = plan.incomingStartMs,
+          outRate = echo.music.iad1tya.playback.mix.MixAudioSink.MIX_RATE,
+        )
+        .start()
+    mixDecoder = decoder
+    synchronized(engine) {
+      engine.arm(plan.currentId, plan.nextId, plan.transition, decoder, MIX_EASE_MS)
+      sink.markOutgoingStream()
+    }
+    activeAutomixPlan = plan
+    isAutomixing.value = plan.isBeatMatch
+    automixDebugInfo.value = automixDebugInfo.value?.copy(status = "mix armed (one clock)")
+    automixLog("mix armed: ${plan.transition.reason}, at ${plan.triggerTimeMs} ms, next from ${plan.incomingStartMs} ms")
+    try {
+      // The engine mixes on its own; wait for it to be ready to hand over.
+      while (true) {
+        val state = synchronized(engine) { engine.state }
+        decoder.failed?.let { reason ->
+          synchronized(engine) { engine.reset() }
+          reportVerdict("FALLBACK no mix: the next song could not be decoded ($reason)", AutomixDebugInfo.VERDICT_FALLBACK)
+          return
+        }
+        if (state == echo.music.iad1tya.playback.mix.MixEngine.State.IDLE) {
+          automixLog("mix: cancelled (${engine.note})")
+          return
+        }
+        if (state == echo.music.iad1tya.playback.mix.MixEngine.State.BLENDING) {
+          automixDebugInfo.value = automixDebugInfo.value?.copy(status = "mixing (one clock)")
+        }
+        if (state == echo.music.iad1tya.playback.mix.MixEngine.State.READY) break
+        if (player.currentMediaItem?.mediaId != outgoingId) {
+          automixLog("mix: the song changed before the handover (${engine.note})")
+          return
+        }
+        delay(20)
+      }
+      val frame = synchronized(engine) { engine.handoverFrame } ?: return
+      val targetMs = frame * 1000 / echo.music.iad1tya.playback.mix.MixAudioSink.MIX_RATE + MIX_HANDOVER_LEAD_MS
+      automixLog("mix: handing over to the player at $targetMs ms of the next song")
+      sink.expectHandover()
+      player.seekTo(nextIndex, targetMs)
+      // The output joins the player's audio by itself; wait for it, for the log and the overlay.
+      val until = android.os.SystemClock.elapsedRealtime() + 5_000
+      while (android.os.SystemClock.elapsedRealtime() < until) {
+        val state = synchronized(engine) { engine.state }
+        if (state == echo.music.iad1tya.playback.mix.MixEngine.State.DONE) {
+          reportVerdict(
+            if (plan.isBeatMatch) "BEAT MATCH ok (one clock): ${plan.overlapMs / 1000} s blend, ${engine.note}"
+            else "SMOOTH mix (one clock): ${plan.transition.reason.removePrefix("smooth: ")}",
+            if (plan.isBeatMatch) AutomixDebugInfo.VERDICT_BEAT_MATCH else AutomixDebugInfo.VERDICT_SMOOTH,
+          )
+          return
+        }
+        if (state == echo.music.iad1tya.playback.mix.MixEngine.State.IDLE) break
+        delay(20)
+      }
+      reportVerdict("FALLBACK handover not joined: ${engine.note}", AutomixDebugInfo.VERDICT_FALLBACK)
+    } finally {
+      decoder.stop()
+      if (mixDecoder === decoder) mixDecoder = null
+      activeAutomixPlan = null
+      isAutomixing.value = false
+      // Plan the next transition once this one is over (scheduling waits while a mix runs).
+      val self = mixJob
+      scope.launch {
+        self?.join()
+        scheduleCrossfade()
+      }
+    }
+  }
+
   /** @param incomingResolved the next song's stream was already checked (see the trigger loop). */
   private fun scheduleCrossfade(incomingResolved: Boolean = false) {
+    // A mix running on the engine is not interrupted: it schedules the next one when done.
+    if (mixJob?.isActive == true) return
     crossfadeTriggerJob?.cancel()
     crossfadeTriggerJob = null
     releasePrebuffered()
     if (pauseAtEndOwner != null && pauseAtEndOwner === currentQueue) return
     if (
-      !crossfadeEnabled || player.duration == C.TIME_UNSET || player.duration <= crossfadeDuration
+      !(crossfadeEnabled || automixEnabled) ||
+        player.duration == C.TIME_UNSET ||
+        player.duration <= crossfadeDuration
     )
       return
     // Fading would cut speech, and the swap would skip an episode's resume and speed.
     if (isCurrentEpisode || isNextItemEpisode()) return
-    if (crossfadeGapless && isNextItemGapless()) return
+    if (!automixEnabled && crossfadeGapless && isNextItemGapless()) return
     if (!player.hasNextMediaItem() && player.repeatMode != REPEAT_MODE_ONE) return
 
     val baseTriggerTime = player.duration - crossfadeDuration.toLong()
@@ -5755,8 +5923,20 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
         } else {
           AutomixPlanResult(plan = null, pairAnalyzed = false)
         }
-      val plan = planResult.plan
       if (automixEnabled && planResult.pairAnalyzed) analyzeUpcomingTracks()
+      // A mix source: the transition runs on the one-clock engine, inside this player's output.
+      val mixSink = playerMixSinks[player]
+      val mixPlan = planResult.plan
+      if (mixPlan != null && automixEnabled && mixSink != null) {
+        if (mixSink.isMixFormat) {
+          mixJob = scope.launch { runMix(mixPlan, mixSink, targetMediaId) }
+          return@launch
+        }
+        automixLog("mix: this song started before the mix was on, plain crossfade this time")
+      }
+      if (!crossfadeEnabled) return@launch
+      // Two players only fade now: beat sync between them is not reliable (the engine does it).
+      val plan: AutomixPlan? = null
       val triggerTime = plan?.triggerTimeMs ?: baseTriggerTime
       if (triggerTime - player.currentPosition <= 0) return@launch
 
@@ -5922,6 +6102,8 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
         positionMs = player.currentPosition,
         fadeMs = crossfadeDuration.toLong(),
         beatSync = AUTOMIX_BEAT_SYNC,
+        // The engine eases the next song back to its tempo and hands it over after the blend.
+        tailRoomMs = MIX_EASE_MS + MIX_HANDOVER_ROOM_MS,
       )
     if (transition == null) {
       automixDebugInfo.value = partialDebug.copy(status = "fallback: trigger out of range")
@@ -7097,6 +7279,14 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
     /** Waiting for data this soon after a seek or a track change is not a stall. */
     private const val STALL_GRACE_MS = 3_000L
     private const val CACHE_SOURCE_KEY = "echo-source"
+    /** The mix engine starts decoding the next song this long before the blend. */
+    private const val MIX_DECODE_LEAD_MS = 25_000L
+    /** How long the mix engine takes after the blend to bring the next song back to its tempo. */
+    private const val MIX_EASE_MS = 8_000L
+    /** Room after that to move the player to the next song before the outgoing one ends. */
+    private const val MIX_HANDOVER_ROOM_MS = 3_000L
+    /** The handover seek lands this far ahead of the engine: about what the player takes to get there. */
+    private const val MIX_HANDOVER_LEAD_MS = 150L
     /** Beat-matched blends between the two players (off: filtered blends only). */
     private const val AUTOMIX_BEAT_SYNC = true
     /** How many of the next songs "Pick the best next song" chooses from. */

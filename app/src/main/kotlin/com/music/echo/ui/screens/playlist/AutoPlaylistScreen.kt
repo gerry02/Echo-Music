@@ -422,6 +422,7 @@ fun AutoPlaylistScreen(
                         playerConnection?.playQueue(
                           ListQueue(
                             title = playlist,
+                            sourceKey = "auto-playlist:${viewModel.playlist}",
                             items = playSongs.map { it.toMediaItem() },
                             startIndex =
                               playSongs.indexOfFirst { it.id == song.id }.coerceAtLeast(0),

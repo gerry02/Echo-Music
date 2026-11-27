@@ -427,6 +427,10 @@ fun AlbumScreen(
 
               Spacer(Modifier.height(24.dp))
 
+              // DJ mix for this album, remembered.
+              echo.music.iad1tya.ui.component.MixSourceChip("album:${albumWithSongs.album.id}")
+              androidx.compose.foundation.layout.Spacer(Modifier.height(8.dp))
+
               Row(
                 modifier = Modifier.fillMaxWidth().padding(horizontal = 32.dp),
                 horizontalArrangement = Arrangement.spacedBy(16.dp),

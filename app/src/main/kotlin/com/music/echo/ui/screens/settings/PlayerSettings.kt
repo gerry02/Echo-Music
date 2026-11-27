@@ -40,9 +40,7 @@ import echo.music.iad1tya.constants.AudioQualityKey
 import echo.music.iad1tya.constants.AutoDownloadOnLikeKey
 import echo.music.iad1tya.constants.AutoLoadMoreKey
 import echo.music.iad1tya.constants.AutoSkipNextOnErrorKey
-import echo.music.iad1tya.constants.AutomixCrossfadeKey
 import echo.music.iad1tya.constants.AutomixDebugOverlayKey
-import echo.music.iad1tya.constants.AutomixPickBestNextKey
 import echo.music.iad1tya.constants.AutoplayOnAutomotiveConnectKey
 import echo.music.iad1tya.constants.CrossfadeDurationKey
 import echo.music.iad1tya.constants.CrossfadeEnabledKey
@@ -108,12 +106,8 @@ fun PlayerSettings(
     rememberPreference(CrossfadeEnabledKey, defaultValue = false)
   val (crossfadeDuration, onCrossfadeDurationChange) =
     rememberPreference(CrossfadeDurationKey, defaultValue = 5f)
-  val (automixCrossfade, onAutomixCrossfadeChange) =
-    rememberPreference(AutomixCrossfadeKey, defaultValue = false)
   val (automixDebugOverlay, onAutomixDebugOverlayChange) =
     rememberPreference(AutomixDebugOverlayKey, defaultValue = false)
-  val (automixPickBestNext, onAutomixPickBestNextChange) =
-    rememberPreference(AutomixPickBestNextKey, defaultValue = false)
   val (crossfadeGapless, onCrossfadeGaplessChange) =
     rememberPreference(CrossfadeGaplessKey, defaultValue = true)
   val (persistentQueue, onPersistentQueueChange) =
@@ -577,7 +571,6 @@ fun PlayerSettings(
                       showCrossfadeBetaDialog = true
                     } else {
                       onCrossfadeEnabledChange(false)
-                      onAutomixCrossfadeChange(false)
                     }
                   },
                   thumbContent = {
@@ -597,7 +590,6 @@ fun PlayerSettings(
                   showCrossfadeBetaDialog = true
                 } else {
                   onCrossfadeEnabledChange(false)
-                  onAutomixCrossfadeChange(false)
                 }
               },
             ),
@@ -654,28 +646,30 @@ fun PlayerSettings(
             )
           }
 
+          // The DJ mix is turned on per playlist, album or radio (their pages, or the queue).
           add(
             Material3SettingsItem(
               isHighlighted = highlightKey == stringResource(R.string.automix),
               icon = painterResource(R.drawable.graphic_eq),
-              title = { Text(stringResource(R.string.automix)) },
-              description = { Text(stringResource(R.string.automix_desc)) },
+              title = { Text(stringResource(R.string.mix_source)) },
+              description = { Text(stringResource(R.string.mix_source_settings_desc)) },
+            ),
+          )
+          add(
+            Material3SettingsItem(
+              isHighlighted = highlightKey == stringResource(R.string.automix_debug),
+              icon = painterResource(R.drawable.bug_report),
+              title = { Text(stringResource(R.string.automix_debug)) },
+              description = { Text(stringResource(R.string.automix_debug_desc)) },
               trailingContent = {
                 Switch(
-                  checked = automixCrossfade,
-                  onCheckedChange = {
-                    onAutomixCrossfadeChange(it)
-                    if (it) {
-                      onCrossfadeEnabledChange(true)
-                    } else {
-                      onCrossfadeEnabledChange(false)
-                    }
-                  },
+                  checked = automixDebugOverlay,
+                  onCheckedChange = onAutomixDebugOverlayChange,
                   thumbContent = {
                     Icon(
                       painter =
                         painterResource(
-                          id = if (automixCrossfade) R.drawable.check else R.drawable.close,
+                          id = if (automixDebugOverlay) R.drawable.check else R.drawable.close,
                         ),
                       contentDescription = null,
                       modifier = Modifier.size(SwitchDefaults.IconSize),
@@ -683,69 +677,9 @@ fun PlayerSettings(
                   },
                 )
               },
-              onClick = {
-                val newValue = !automixCrossfade
-                onAutomixCrossfadeChange(newValue)
-                if (newValue) {
-                  onCrossfadeEnabledChange(true)
-                } else {
-                  onCrossfadeEnabledChange(false)
-                }
-              },
+              onClick = { onAutomixDebugOverlayChange(!automixDebugOverlay) },
             ),
           )
-          if (automixCrossfade) {
-            add(
-              Material3SettingsItem(
-                isHighlighted = highlightKey == stringResource(R.string.automix_pick_best_next),
-                icon = painterResource(R.drawable.queue_music),
-                title = { Text(stringResource(R.string.automix_pick_best_next)) },
-                description = { Text(stringResource(R.string.automix_pick_best_next_desc)) },
-                trailingContent = {
-                  Switch(
-                    checked = automixPickBestNext,
-                    onCheckedChange = onAutomixPickBestNextChange,
-                    thumbContent = {
-                      Icon(
-                        painter =
-                          painterResource(
-                            id = if (automixPickBestNext) R.drawable.check else R.drawable.close,
-                          ),
-                        contentDescription = null,
-                        modifier = Modifier.size(SwitchDefaults.IconSize),
-                      )
-                    },
-                  )
-                },
-                onClick = { onAutomixPickBestNextChange(!automixPickBestNext) },
-              ),
-            )
-            add(
-              Material3SettingsItem(
-                isHighlighted = highlightKey == stringResource(R.string.automix_debug),
-                icon = painterResource(R.drawable.bug_report),
-                title = { Text(stringResource(R.string.automix_debug)) },
-                description = { Text(stringResource(R.string.automix_debug_desc)) },
-                trailingContent = {
-                  Switch(
-                    checked = automixDebugOverlay,
-                    onCheckedChange = onAutomixDebugOverlayChange,
-                    thumbContent = {
-                      Icon(
-                        painter =
-                          painterResource(
-                            id = if (automixDebugOverlay) R.drawable.check else R.drawable.close,
-                          ),
-                        contentDescription = null,
-                        modifier = Modifier.size(SwitchDefaults.IconSize),
-                      )
-                    },
-                  )
-                },
-                onClick = { onAutomixDebugOverlayChange(!automixDebugOverlay) },
-              ),
-            )
-          }
 
           add(
             Material3SettingsItem(
