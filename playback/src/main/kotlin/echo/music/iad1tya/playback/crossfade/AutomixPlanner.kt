@@ -133,7 +133,7 @@ object AutomixPlanner {
   )
 
   /** Length of the filtered blend between two songs with a beat that are not beat-synced. */
-  const val FILTERED_BLEND_MS = 8_000L
+  const val FILTERED_BLEND_MS = 12_000L
 
   /**
    * @param positionMs where the outgoing song is now: a plan never starts in the past.
@@ -158,8 +158,8 @@ object AutomixPlanner {
       if (abs(ratio - 1f) <= MAX_TEMPO_CHANGE) {
         beatMatch(out, incoming, ratio, earliest, tailRoomMs)?.let { return it }
       }
-      // Tempos too far apart to lay one over the other: an echo out, the next song on the one.
-      echoOut(out, incoming, earliest, tailRoomMs, "tempos too far apart")?.let { return it }
+      // Tempos too far apart to lay one over the other: a long filtered fade (see smooth), the
+      // outgoing drums and highs gone before the incoming song is up, so the rhythms never meet.
     }
     return smooth(out, incoming, earliest, fadeMs, beatSync, tailRoomMs)
   }
@@ -254,7 +254,11 @@ object AutomixPlanner {
         ?.takeIf { it + beats * outPeriod <= hardEnd }
         ?.let { snapNearest(it, out.tailBars, outBar) }
         ?: snapDown(minOf(audibleEnd, hardEnd) - beats * outPeriod, out.tailBars, outBar)
-    val floor = maxOf(earliest.toDouble(), out.earliestMixOutMs)
+    // Never before the song's last minute (or quarter), unless a whole 8-bar blend only fits a
+    // little earlier: a short blend sounds rushed. Never before 60 % of the song either.
+    val wholeBlendFrom = snapDown(hardEnd - beats * outPeriod, out.tailBars, outBar)
+    val floor =
+      maxOf(earliest.toDouble(), minOf(out.earliestMixOutMs, maxOf(wholeBlendFrom, out.durationMs * 0.6)))
     if (trigger < floor) trigger = snapUp(floor, out.tailBars, outBar)
     // Late (a seek near the end): shrink the blend by whole bars to what is left.
     while (beats > MIN_BLEND_BEATS && trigger + beats * outPeriod > hardEnd) beats -= 4
@@ -407,16 +411,17 @@ object AutomixPlanner {
     if (plan.style == Style.SMOOTH) {
       val g = EqualPowerCurve.calculateGains(p)
       if (!plan.filters) return Mix(g.outgoingGain, g.incomingGain)
-      // One bassline at a time, handed over in the middle; the incoming song comes in thin and
-      // fills out, the outgoing one leaves dull: their drums never stack at full range.
-      val swap = smoothstep(ramp(p, 0.4f, 0.6f))
+      // Two beats that do not line up must not be heard at full range together: the outgoing
+      // song dulls first (its drums and highs go under a low-pass), the incoming one comes up
+      // after it, thin, and fills out; one bassline at a time.
+      val swap = smoothstep(ramp(p, 0.45f, 0.6f))
       return Mix(
-        outGain = g.outgoingGain,
-        inGain = g.incomingGain,
+        outGain = kotlin.math.cos(PI / 2 * ramp(p, 0.35f, 1f)).toFloat(),
+        inGain = sin(PI / 2 * ramp(p, 0.25f, 0.85f)).toFloat(),
         outBassCut = swap,
         inBassCut = 1f - swap,
-        outLowPass = 0.8f * smoothstep(ramp(p, 0.3f, 1f)),
-        inHighPass = 0.5f * (1f - smoothstep(ramp(p, 0f, 0.6f))),
+        outLowPass = 0.9f * smoothstep(ramp(p, 0f, 0.5f)),
+        inHighPass = 0.55f * (1f - smoothstep(ramp(p, 0.3f, 0.8f))),
       )
     }
     // A DJ's hand-over, band by band, so no band ever sounds twice:

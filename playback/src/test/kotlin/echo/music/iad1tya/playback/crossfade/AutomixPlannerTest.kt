@@ -96,20 +96,20 @@ class AutomixPlannerTest {
   }
 
   @Test
-  fun farTemposEchoOutAtTheOutroAndDropTheNextSongOnTheOne() {
+  fun farTemposGetALongFilteredFadeTheirDrumsNeverTogether() {
     val plan = AutomixPlanner.plan(track(), track(bpm = 90f), positionMs = 60_000, fadeMs = 6_000)!!
-    assertEquals(Style.ECHO_OUT, plan.style)
+    assertEquals(Style.SMOOTH, plan.style)
     assertEquals(1f, plan.incomingSpeed)
-    assertEquals(182_250L, plan.triggerMs)
-    // 8 beats of repeats over the next song.
-    assertEquals(4_000L, plan.overlapMs)
-    val start = AutomixPlanner.mixAt(plan, 0f)
-    assertEquals(1f, start.outEcho, 0f)
-    // A beat in: the outgoing song's dry sound gone, the next one up, the repeats ringing on.
-    val later = AutomixPlanner.mixAt(plan, 0.2f)
-    assertEquals(0f, later.outGain, 0.001f)
-    assertEquals(1f, later.inGain, 0.001f)
-    assertEquals(0f, later.outEcho, 0f)
+    assertEquals(AutomixPlanner.FILTERED_BLEND_MS, plan.overlapMs)
+    // The outgoing song is dull (drums and highs under the low-pass) before the next one is up.
+    val early = AutomixPlanner.mixAt(plan, 0.3f)
+    assertTrue(early.outLowPass > 0.5f)
+    assertTrue(early.inGain < 0.2f)
+    // One bassline at a time.
+    for (i in 0..100) {
+      val m = AutomixPlanner.mixAt(plan, i / 100f)
+      assertTrue(m.outBassCut + m.inBassCut >= 0.99f)
+    }
   }
 
   @Test

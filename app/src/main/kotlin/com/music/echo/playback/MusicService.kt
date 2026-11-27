@@ -7014,11 +7014,11 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
     /** The mix engine starts decoding the next song this long before the blend. */
     private const val MIX_DECODE_LEAD_MS = 25_000L
     /** Beats after the blend over which the engine brings the next song back to its own tempo. */
-    private const val MIX_EASE_BEATS = 16
+    private const val MIX_EASE_BEATS = 8
     /** Blend progress from which the screen shows the next song. */
     private const val MIX_SHOW_NEXT_AT = 0.5f
     /** Room after the blend (the tempo ramp, the player taking over) before the outgoing song ends. */
-    private const val MIX_TAIL_ROOM_MS = 12_000L
+    private const val MIX_TAIL_ROOM_MS = 7_000L
     /** The handover seek lands this far ahead of the engine: about what the player takes to get there. */
     private const val MIX_HANDOVER_LEAD_MS = 150L
     /** Beat-matched blends between the two players (off: filtered blends only). */

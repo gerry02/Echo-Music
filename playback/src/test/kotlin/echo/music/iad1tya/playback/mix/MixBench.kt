@@ -57,7 +57,7 @@ class MixBench {
         track(rb, bMs),
         positionMs = 0,
         fadeMs = 8_000,
-        tailRoomMs = 12_000L,
+        tailRoomMs = 7_000L,
       ) ?: error("no plan")
     log(
       "plan: ${plan.reason}: mix at %.2f s for %.1f s, B from %.2f s at x%.4f, bass swap at %.2f"
@@ -69,7 +69,7 @@ class MixBench {
     // As the app does: the whole transition in the mixer (the stretch eased back over 16 beats),
     // then the player moves to B at its own tempo.
     val beatMs = plan.overlapMs * plan.beatFraction
-    engine.arm("a", "b", plan, arraySource(b, bStart), null, 0, plan.overlapMs, easeMs = (beatMs * 16).toLong())
+    engine.arm("a", "b", plan, arraySource(b, bStart), null, 0, plan.overlapMs, easeMs = (beatMs * 8).toLong())
 
     // From 20 s before the mix: the outgoing song, block by block like a player.
     val from = ((plan.triggerMs - LEAD_MS) * rate / 1000).coerceAtLeast(0L).toInt()
