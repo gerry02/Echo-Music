@@ -654,6 +654,9 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
   /** The next song being decoded for the mix running now. */
   private var mixDecoder: echo.music.iad1tya.playback.mix.IncomingDecoder? = null
 
+  /** The song whose transition is not mixed this time (the next one was not ready). */
+  private var mixSkippedFor: String? = null
+
   /** The transition running on the mix engine, apart from the crossfade scheduler's job. */
   private var mixJob: Job? = null
   private val playerStereoWideners = HashMap<Player, StereoWidenerAudioProcessor>()
@@ -5822,13 +5825,24 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
       automixLog("mix: too late to arm (pos ${player.currentPosition}, mix at ${plan.triggerTimeMs})")
       return
     }
+    // The next song exactly as the player will play it: its own cached bytes (the player reads far
+    // ahead), the same stream (a lossless file or YouTube, whichever it resolved), under the same
+    // key. Another stream of the same song can be another master, which would not join.
+    val nextCache = if (downloadCache.getCachedSpans(plan.nextId).isNotEmpty()) downloadCache else playerCache
+    val buffered =
+      runCatching { echo.music.iad1tya.playback.audio.CacheMediaDataSource(nextCache, plan.nextId).use { it.isUsable } }
+        .getOrDefault(false)
+    if (!buffered) {
+      automixLog("mix: the next song is not buffered by the player yet, plain transition this time")
+      mixSkippedFor = plan.currentId
+      scope.launch { scheduleCrossfade() }
+      return
+    }
     mixDecoder?.stop()
     val decoder =
       echo.music.iad1tya.playback.mix
         .IncomingDecoder(
-          openSource = {
-            echo.music.iad1tya.playback.audio.StreamMediaDataSource(analysisDataSourceFactory, plan.nextId)
-          },
+          openSource = { echo.music.iad1tya.playback.audio.CacheMediaDataSource(nextCache, plan.nextId) },
           startMs = plan.incomingStartMs,
           outRate = echo.music.iad1tya.playback.mix.MixAudioSink.MIX_RATE,
         )
@@ -5847,8 +5861,13 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
       while (true) {
         val state = synchronized(engine) { engine.state }
         decoder.failed?.let { reason ->
+          val before = state == echo.music.iad1tya.playback.mix.MixEngine.State.WAITING
           synchronized(engine) { engine.reset() }
           reportVerdict("FALLBACK no mix: the next song could not be decoded ($reason)", AutomixDebugInfo.VERDICT_FALLBACK)
+          if (before) {
+            // Not started yet: a plain transition instead.
+            mixSkippedFor = plan.currentId
+          }
           return
         }
         if (state == echo.music.iad1tya.playback.mix.MixEngine.State.IDLE) {
@@ -5943,7 +5962,7 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
       // A mix source: the transition runs on the one-clock engine, inside this player's output.
       val mixSink = playerMixSinks[player]
       val mixPlan = planResult.plan
-      if (mixPlan != null && automixEnabled && mixSink != null) {
+      if (mixPlan != null && automixEnabled && mixSink != null && mixSkippedFor != mixPlan.currentId) {
         if (mixSink.isMixFormat) {
           mixJob = scope.launch { runMix(mixPlan, mixSink, targetMediaId) }
           return@launch

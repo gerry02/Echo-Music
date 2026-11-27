@@ -89,6 +89,10 @@ class MixEngine(val rate: Int, val channels: Int = 2) {
   private var playerBufferFrames = 0
   /** How alike the player's audio and ours were at the match (1 = the same samples). */
   private var lastMatchScore = 0.0
+  /** The match found no common sample: the player plays other audio than we decoded. */
+  private var differentAudio = false
+  /** Our next raw frame when the player's first block of the next song came. */
+  private var firstPlayerQ = 0L
   /** Player frame = our raw frame - offset, once matched. */
   private var matchOffset: Long? = null
 
@@ -130,6 +134,7 @@ class MixEngine(val rate: Int, val channels: Int = 2) {
     aheadFrames = 0
     playerBufferFrames = 0
     matchOffset = null
+    differentAudio = false
   }
 
   val isActive: Boolean
@@ -236,11 +241,23 @@ class MixEngine(val rate: Int, val channels: Int = 2) {
       readAheadTo(playerBufferStart + MATCH_FRAMES + MATCH_RANGE + 1)
       matchOffset = findOffset()
       note = "player matched at offset ${matchOffset} frames (score ${"%.3f".format(lastMatchScore)})"
+      if (lastMatchScore < MIN_MATCH_SCORE) {
+        // Not the same audio (another master or edit of the song, or another stream): no sample
+        // to splice on. Fade over to the player where it is instead of jumping inside it.
+        differentAudio = true
+        note += ": the player plays different audio, crossfaded over to it"
+      }
+    }
+    if (differentAudio && playerBufferFrames < WEAK_FADE_FRAMES) {
+      // Enough of the player's audio for the longer crossfade first.
+      return fill(frames)
     }
     val offset = matchOffset!!
     // Our next frame is raw frame q; the player's same sample is q - offset.
     val q = nextOutputRawFrame()
-    val wantPlayer = q - offset
+    // Other audio: its time runs alongside ours from its first block (what we played meanwhile
+    // stands for those frames of it).
+    val wantPlayer = if (differentAudio) playerBufferStart + (q - firstPlayerQ) else q - offset
     val out = FloatArray((playerBufferFrames + frames) * channels)
     var produced = 0
     if (wantPlayer < playerBufferStart) {
@@ -258,14 +275,17 @@ class MixEngine(val rate: Int, val channels: Int = 2) {
       if (behind > playerBufferFrames - rate / 100) return FloatArray(0)
       dropPlayer(behind.toInt())
     }
-    // Switch, with a 5 ms crossfade against our own copy of the same sample.
-    val fade = (rate / 200).coerceAtMost(playerBufferFrames)
+    // Switch, with a 5 ms crossfade against our own copy of the same sample (equal power over
+    // 300 ms when the player's audio is not the same).
+    val fade = (if (differentAudio) WEAK_FADE_FRAMES else rate / 200).coerceAtMost(playerBufferFrames)
     val ours = fill(fade)
     for (i in 0 until fade) {
-      val w = (i + 1).toFloat() / (fade + 1)
+      val t = (i + 1).toFloat() / (fade + 1)
+      val wIn = if (differentAudio) kotlin.math.sin(t * Math.PI / 2).toFloat() else t
+      val wOut = if (differentAudio) kotlin.math.cos(t * Math.PI / 2).toFloat() else 1 - t
       for (c in 0 until channels) {
         val k = i * channels + c
-        out[(produced + i) * channels + c] = ours[k] * (1 - w) + playerBuffer[k] * w
+        out[(produced + i) * channels + c] = ours[k] * wOut + playerBuffer[k] * wIn
       }
     }
     val rest = playerBufferFrames - fade
@@ -372,7 +392,10 @@ class MixEngine(val rate: Int, val channels: Int = 2) {
   }
 
   private fun appendPlayer(x: FloatArray, frames: Int, songFrame: Long) {
-    if (playerBufferFrames == 0) playerBufferStart = songFrame
+    if (playerBufferFrames == 0) {
+      playerBufferStart = songFrame
+      firstPlayerQ = nextOutputRawFrame()
+    }
     val need = (playerBufferFrames + frames) * channels
     if (need > playerBuffer.size) playerBuffer = playerBuffer.copyOf(maxOf(need, playerBuffer.size * 2))
     System.arraycopy(x, 0, playerBuffer, playerBufferFrames * channels, frames * channels)
@@ -430,5 +453,11 @@ class MixEngine(val rate: Int, val channels: Int = 2) {
     /** Frames of the player's audio compared, and how far either way (~25 ms at 48 kHz). */
     const val MATCH_FRAMES = 2048
     const val MATCH_RANGE = 1200
+    /**
+     * Below this the player's audio and ours are not the same samples (the same decode scores
+     * about 1, two decoders of one file over 0.95): not spliced, crossfaded.
+     */
+    const val MIN_MATCH_SCORE = 0.8
+    private const val WEAK_FADE_FRAMES = 14_400
   }
 }

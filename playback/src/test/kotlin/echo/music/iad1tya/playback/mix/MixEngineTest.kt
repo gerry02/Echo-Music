@@ -155,6 +155,37 @@ class MixEngineTest {
   }
 
   @Test
+  fun whenThePlayerPlaysOtherAudioItIsCrossfadedNotSpliced() {
+    // The player's stream is another master of the song (the FLAC, the mixer read YouTube):
+    // nothing matches, and the output must fade over to the player's audio, not jump in it.
+    val a = noise(40.0, 1)
+    val b = noise(70.0, 2)
+    val other = noise(70.0, 9)
+    val e = MixEngine(rate)
+    val inStart = 6_000L
+    e.arm("a", "b", plan(10_000, inStart, 8_000, 1f, 16), source(b, inStart * rate / 1000), 0)
+    var out = runOutgoing(e, a, 0, rate * 19)
+    assertEquals(MixEngine.State.READY, e.state)
+    val q = e.handoverFrame!!
+    e.startHandover()
+    val handoverOut = out.size / 2
+    var p = q + 2_000
+    val tail = ArrayList<FloatArray>()
+    repeat(40) {
+      val block = FloatArray(1_024 * 2) { i -> other[((p * 2) + i).toInt()] }
+      tail += e.processIncoming(block, 1_024, p)
+      p += 1_024
+    }
+    out += tail.fold(FloatArray(0)) { acc, x -> acc + x }
+    assertEquals(MixEngine.State.DONE, e.state)
+    assertTrue(e.note, e.note.contains("different audio"))
+    // Every frame came out (a crossfade, no gap), and it ends on the player's own audio.
+    assertEquals(handoverOut + 40 * 1_024, out.size / 2)
+    val last = out.size / 2 - 1
+    assertEquals(other[((p - 1) * 2).toInt()], out[last * 2], 1e-4f)
+  }
+
+  @Test
   fun handoverIsSeamlessWhenThePlayerLandsLate() = handover(playerShift = -700, decoderOffset = 0)
 
   @Test
