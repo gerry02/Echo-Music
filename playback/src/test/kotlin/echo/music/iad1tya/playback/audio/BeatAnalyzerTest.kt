@@ -5,9 +5,16 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.junit.Before
 import org.junit.Test
 
+/** The onset-statistics analysis (no tracker). */
 class BeatAnalyzerTest {
+
+  @Before
+  fun noTracker() {
+    BeatAnalyzer.tracker = null
+  }
 
   /** Distance of [ms] from the nearest point of a grid, in ms. */
   private fun gridError(ms: Long, anchor: Double, period: Double): Double {

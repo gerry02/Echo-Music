@@ -131,18 +131,35 @@ class MixBench {
     assumeTrue("set -Pmix.scan to scan a folder", dir != null)
     val files =
       File(dir!!).listFiles { f -> f.extension.lowercase() in setOf("mp3", "flac", "m4a", "opus", "webm", "ogg", "wav") }
-        ?.sortedBy { it.name } ?: emptyList()
+        ?.sortedBy { it.name }
+        ?.let { all ->
+          // -Pmix.max=N: an even sample of N songs.
+          val max = System.getProperty("mix.max")?.toIntOrNull()
+          if (max == null || max >= all.size) all else all.filterIndexed { i, _ -> i % ((all.size + max - 1) / max) == 0 }
+        } ?: emptyList()
+    val out = System.getProperty("mix.out")?.let { File(it) } ?: File(dir, "mixbench-scan.txt")
+    out.writeText("")
     val lines = ArrayList<String>()
+    var trackedSure = 0
+    var dspSure = 0
     for (f in files) {
-      val r = runCatching { analyze(decode(f.path)) }.getOrNull()
+      val x = runCatching { decode(f.path) }.getOrNull()
+      val r = x?.let { runCatching { analyze(it, useTracker = true) }.getOrNull() }
+      val d = x?.let { runCatching { analyze(it, useTracker = false) }.getOrNull() }
+      if ((r?.confidence ?: 0f) >= AutomixPlanner.MIN_CONFIDENCE) trackedSure++
+      if ((d?.confidence ?: 0f) >= AutomixPlanner.MIN_CONFIDENCE) dspSure++
       val line =
-        r?.let { "%7.2f bpm  conf %.2f  key %s%s  %s".format(it.bpm, it.confidence, it.keyPitchClass ?: "-", if (it.keyIsMinor == true) "m" else "", f.name) }
-          ?: "   failed            ${f.name}"
+        "beat this %7.2f bpm conf %.2f | old %7.2f bpm conf %.2f | %s".format(
+          r?.bpm ?: 0f, r?.confidence ?: 0f, d?.bpm ?: 0f, d?.confidence ?: 0f, f.name,
+        )
       println(line)
       lines += line
+      out.appendText(line + System.lineSeparator()) // written as it goes: stopping loses nothing
     }
-    val out = System.getProperty("mix.out")?.let { File(it) } ?: File(dir, "mixbench-scan.txt")
-    out.writeText(lines.joinToString(System.lineSeparator()))
+    val summary = "clear beat: beat this ${trackedSure}/${files.size}, old ${dspSure}/${files.size}"
+    println(summary)
+    out.appendText(summary + System.lineSeparator())
+
   }
 
   private fun track(r: BeatAnalyzer.Result, durationMs: Long) =
@@ -163,7 +180,8 @@ class MixBench {
     )
 
   /** The same windows the phone analyzes: 18 s mid, the first 20 s, the last 30 s. */
-  private fun analyze(x: FloatArray): BeatAnalyzer.Result? {
+  private fun analyze(x: FloatArray, useTracker: Boolean = System.getProperty("mix.tracker") != "dsp"): BeatAnalyzer.Result? {
+    BeatAnalyzer.tracker = if (useTracker) beatThis else null
     val frames = x.size / 2
     fun mono(fromMs: Long, lenMs: Long): Pair<MonoPcm, Long> {
       val start = (fromMs * rate / 1000).toInt().coerceIn(0, frames)
@@ -248,6 +266,14 @@ class MixBench {
   }
 
   companion object {
+    /** Beat This! from the app's assets, on the desktop ONNX Runtime. */
+    private val beatThis by lazy {
+      val dir = File("src/main/assets/beatthis")
+      echo.music.iad1tya.playback.audio.BeatThisTracker(
+        File(dir, "mel_spectrogram.onnx").readBytes(),
+        File(dir, "beat_this_small.onnx").readBytes(),
+      )
+    }
     private const val BLOCK = 1_152
     private const val LEAD_MS = 20_000L
     /** Room after the ease to move the player to the next song before the outgoing one ends. */

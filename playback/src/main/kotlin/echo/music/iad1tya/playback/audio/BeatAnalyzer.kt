@@ -25,7 +25,7 @@ import timber.log.Timber
 object BeatAnalyzer {
 
   /** Bumped when the analysis changes so stored rows are redone once. */
-  const val VERSION = 4
+  const val VERSION = 5
 
   data class Result(
     val bpm: Float,
@@ -87,6 +87,11 @@ object BeatAnalyzer {
 
   /** Comb strength from which a window has a beat of its own (1 = none). */
   private const val MIN_LOCAL_BEAT_STRENGTH = 1.3f
+
+  /** Fewest beats the tracker must find in a window for it to count. */
+  private const val MIN_TRACKED_BEATS = 8
+  /** A tracked beat this close to the fitted grid counts as on it. */
+  private const val ON_GRID_MS = 35.0
 
   /** Beat vs offbeat margin below which the beat is not trusted for a beat-matched mix. */
   private const val MIN_HALF_BEAT_MARGIN = 0.04
@@ -309,6 +314,16 @@ object BeatAnalyzer {
 
   /** Everything from the decoded windows; pure, so unit tests can feed it synthetic songs. */
   fun analyzePcm(windows: Windows, knownBpm: Float? = null): Result? {
+    tracker?.let { t ->
+      val grid =
+        try {
+          trackedGrid(windows, t)
+        } catch (e: Throwable) {
+          Timber.tag(TAG).w(e, "Beat tracker failed, onset statistics instead")
+          null
+        }
+      if (grid != null) return finish(windows, grid)
+    }
     val midSpectrum = windows.middle?.let { BeatDsp.spectrum(it) }
 
     var periodMs: Double
@@ -456,6 +471,47 @@ object BeatAnalyzer {
     val headAnchor = localDownbeat(headGrid)
     val tailAnchor = localDownbeat(tailGrid)
 
+    return finish(
+      windows,
+      Grid(
+        periodMs = periodMs,
+        confidence = confidence,
+        midBeatMs = midBeatMs,
+        midDownbeatMs = midDownbeatMs,
+        headAnchor = headAnchor,
+        tailAnchor = tailAnchor,
+        headBeatMs = headGrid?.beatMs,
+        tailBeatMs = tailGrid?.beatMs,
+        key = key,
+        phaseNote = phaseNote,
+      ),
+    )
+  }
+
+  /** What a beat grid gives, from either way of finding it. */
+  private class Grid(
+    val periodMs: Double,
+    val confidence: Float,
+    val midBeatMs: Double?,
+    val midDownbeatMs: Double?,
+    val headAnchor: Double?,
+    val tailAnchor: Double?,
+    val headBeatMs: Double?,
+    val tailBeatMs: Double?,
+    val key: Pair<Int, Boolean>?,
+    val phaseNote: String,
+  )
+
+  /** Mix points, silences and the result, from a beat grid. */
+  private fun finish(windows: Windows, g: Grid): Result? {
+    val periodMs = g.periodMs
+    val confidence = g.confidence
+    val midBeatMs = g.midBeatMs
+    val midDownbeatMs = g.midDownbeatMs
+    val headAnchor = g.headAnchor
+    val tailAnchor = g.tailAnchor
+    val key = g.key
+    val phaseNote = g.phaseNote
     val firstSound = windows.head?.let { firstSoundMs(it, windows.headStartMs) }
     val lastSound = windows.tail?.let { lastSoundMs(it, windows.tailStartMs) }
 
@@ -484,7 +540,7 @@ object BeatAnalyzer {
           ?.roundToLong()
       }
 
-    val gridAnchor = midBeatMs ?: headGrid?.beatMs ?: tailGrid?.beatMs ?: return null
+    val gridAnchor = midBeatMs ?: g.headBeatMs ?: g.tailBeatMs ?: return null
     val barAnchor = midDownbeatMs ?: headAnchor ?: tailAnchor
     return Result(
       bpm = (60_000.0 / periodMs).toFloat(),
@@ -501,6 +557,115 @@ object BeatAnalyzer {
       lastSoundMs = lastSound,
       durationMs = windows.durationMs,
       phaseNote = listOf(phaseNote, windows.note).filter { it.isNotBlank() }.joinToString("; "),
+    )
+  }
+
+  /**
+   * The beat tracker used by [analyzePcm] when set (Beat This!, loaded by the app); without it, or
+   * when it finds too few beats, the onset statistics below are used.
+   */
+  @Volatile var tracker: BeatTracker? = null
+
+  /**
+   * A beat grid from the tracker's beats: the tempo from a straight line through each window's
+   * beats (missed beats skipped by their spacing), tightened by the beats counted between windows
+   * minutes apart; the bars from where its downbeats fall on that grid.
+   */
+  private fun trackedGrid(windows: Windows, tracker: BeatTracker): Grid? {
+    class Win(val name: String, val startMs: Long, val beats: DoubleArray, val downs: DoubleArray)
+    val wins =
+      listOfNotNull(
+          windows.middle?.let { m -> tracker.track(m)?.let { Win("mid", windows.middleStartMs, it.beatsMs, it.downbeatsMs) } },
+          windows.head?.let { m -> tracker.track(m)?.let { Win("head", windows.headStartMs, it.beatsMs, it.downbeatsMs) } },
+          windows.tail?.let { m -> tracker.track(m)?.let { Win("tail", windows.tailStartMs, it.beatsMs, it.downbeatsMs) } },
+        )
+        .filter { it.beats.size >= MIN_TRACKED_BEATS }
+    if (wins.isEmpty()) return null
+    val ibis = wins.flatMap { w -> (1 until w.beats.size).map { w.beats[it] - w.beats[it - 1] } }.sorted()
+    var period = ibis[ibis.size / 2]
+    if (period < 200 || period > 2_000) return null
+
+    class Fit(val win: Win, val period: Double, val firstMs: Double, val onGrid: Double)
+    fun fit(w: Win, p: Double): Fit {
+      // The grid's phase from all beats at once (a circular mean), then each beat's number on it:
+      // a stray beat between two others, or a missed one, does not shift the rest.
+      var sx = 0.0
+      var sy = 0.0
+      for (t in w.beats) {
+        sx += kotlin.math.cos(2 * Math.PI * t / p)
+        sy += kotlin.math.sin(2 * Math.PI * t / p)
+      }
+      var phase = kotlin.math.atan2(sy, sx) / (2 * Math.PI) * p
+      var slope = p
+      var inliers = IntArray(0)
+      repeat(3) {
+        val k = DoubleArray(w.beats.size) { i -> Math.round((w.beats[i] - phase) / slope).toDouble() }
+        inliers =
+          w.beats.indices.filter { i -> abs(w.beats[i] - (phase + k[i] * slope)) < ON_GRID_MS }.toIntArray()
+        if (inliers.size < 4) return Fit(w, p, w.startMs + phase, inliers.size.toDouble() / w.beats.size)
+        val mk = inliers.map { k[it] }.average()
+        val mt = inliers.map { w.beats[it] }.average()
+        var sxy = 0.0
+        var sxx = 0.0
+        for (i in inliers) {
+          sxy += (k[i] - mk) * (w.beats[i] - mt)
+          sxx += (k[i] - mk) * (k[i] - mk)
+        }
+        if (sxx > 0) slope = sxy / sxx
+        phase = mt - slope * mk
+      }
+      // Beat 0 of the grid near the window's first beat.
+      val first = phase + Math.round((w.beats.first() - phase) / slope) * slope
+      return Fit(w, slope, w.startMs + first, inliers.size.toDouble() / w.beats.size)
+    }
+    var fits = wins.map { fit(it, period) }
+    period = fits.sumOf { it.period * it.win.beats.size } / fits.sumOf { it.win.beats.size }
+    fits = wins.map { fit(it, period) }
+    // Windows minutes apart pin the tempo far tighter than any one of them.
+    val ordered = fits.sortedBy { it.firstMs }
+    if (ordered.size >= 2) {
+      val span = ordered.last().firstMs - ordered.first().firstMs
+      val beats = (span / period).roundToLong()
+      if (beats > 16) {
+        val refined = span / beats
+        // Only when the beat count between them is certain (a beat off over 400 is 0.25 %).
+        if (abs(refined / period - 1) < 0.001) period = refined
+      }
+    }
+    val spread = fits.maxOf { it.period } / fits.minOf { it.period } - 1
+    var confidence = fits.map { it.onGrid }.average()
+    // The tempo moves (live playing, rubato): a fixed grid does not hold across the song.
+    if (spread > 0.02) confidence *= 0.5
+
+    fun barAnchor(f: Fit): Double? {
+      if (f.win.downs.isEmpty()) return null
+      val votes = IntArray(4)
+      for (d in f.win.downs) {
+        val k = ((f.win.startMs + d - f.firstMs) / period).roundToLong()
+        votes[(((k % 4) + 4) % 4).toInt()]++
+      }
+      val best = votes.indices.maxByOrNull { votes[it] } ?: return null
+      return f.firstMs + best * period
+    }
+    val mid = fits.firstOrNull { it.win.name == "mid" }
+    val head = fits.firstOrNull { it.win.name == "head" }
+    val tail = fits.firstOrNull { it.win.name == "tail" }
+    val midBar = mid?.let { barAnchor(it) }
+    val key = windows.middle?.let { m -> BeatDsp.spectrum(m)?.let { BeatDsp.key(it) } }
+    val note =
+      "beat this: " +
+        fits.joinToString(", ") { "%s %d beats %.0f%% on grid".format(it.win.name, it.win.beats.size, it.onGrid * 100) }
+    return Grid(
+      periodMs = period,
+      confidence = confidence.toFloat().coerceIn(0f, 1f),
+      midBeatMs = mid?.firstMs ?: head?.firstMs ?: tail?.firstMs,
+      midDownbeatMs = midBar,
+      headAnchor = head?.let { barAnchor(it) },
+      tailAnchor = tail?.let { barAnchor(it) },
+      headBeatMs = head?.firstMs,
+      tailBeatMs = tail?.firstMs,
+      key = key,
+      phaseNote = note,
     )
   }
 

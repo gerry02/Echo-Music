@@ -1458,6 +1458,22 @@ class MusicService : MediaLibraryService(), Player.Listener, PlaybackStatsListen
       .distinctUntilChanged()
       .collect(scope) { YTPlayerUtils.forceOpusEnabled = it }
 
+    // Beat This! finds the beats and bars for the mix: loaded once, off the main thread.
+    if (BeatAnalyzer.tracker == null) {
+      scope.launch(Dispatchers.IO) {
+        try {
+          BeatAnalyzer.tracker =
+            echo.music.iad1tya.playback.audio.BeatThisTracker(
+              assets.open("beatthis/mel_spectrogram.onnx").use { it.readBytes() },
+              assets.open("beatthis/beat_this_small.onnx").use { it.readBytes() },
+            )
+          automixLog("beat tracker: Beat This! loaded")
+        } catch (e: Throwable) {
+          automixLog("beat tracker: Beat This! not loaded (${e.message}), onset statistics instead")
+        }
+      }
+    }
+
     // The mix is set per source (playlist, album, radio): follow the playing one's setting.
     activeQueue
       .map { mixKeyOf(it) }
